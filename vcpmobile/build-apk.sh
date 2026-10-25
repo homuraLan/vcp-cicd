@@ -151,6 +151,18 @@ else
   cd "$SRC"
   export CARGO_NET_GIT_FETCH_WITH_CLI=true
 
+  # 签名参数必须导出成 ANDROID_KEY* 环境变量，
+  # tauri 的 gradle 配置只认这几个名字，缺任一个都会在打包阶段失败
+  if [ -n "$KEYSTORE_PATH" ] && [ -f "$KEYSTORE_PATH" ]; then
+    export ANDROID_KEYSTORE_PATH="$KEYSTORE_PATH"
+    export ANDROID_KEY_ALIAS="$KEY_ALIAS"
+    export ANDROID_KEYSTORE_PASSWORD="$KEY_PASS"
+    export ANDROID_KEY_PASSWORD="$KEY_PASS"
+    echo "--- 已配置签名: $KEY_ALIAS ($(stat -c %s "$KEYSTORE_PATH") 字节)"
+  else
+    echo "--- 未配置签名，产出未签名 APK"
+  fi
+
   echo "--- 依赖安装"
   if [ -f pnpm-lock.yaml ]; then
     pnpm install --frozen-lockfile
