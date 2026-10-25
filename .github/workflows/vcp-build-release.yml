@@ -42,15 +42,124 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ============ 0. 检测上游更新 ============
+  # 三个上游各自独立判断，谁有新提交就只构建谁。
+  # 判断依据：上游最新提交 SHA 与上次成功构建记录的 SHA 不同。
+  # 记录存在本仓库的 state 分支上，每个上游一个文件。
+  detect:
+    name: 检测上游更新
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      backend: ${{ steps.check.outputs.backend }}
+      mobile: ${{ steps.check.outputs.mobile }}
+      desktop: ${{ steps.check.outputs.desktop }}
+      backend_sha: ${{ steps.check.outputs.backend_sha }}
+      mobile_sha: ${{ steps.check.outputs.mobile_sha }}
+      desktop_sha: ${{ steps.check.outputs.desktop_sha }}
+      any: ${{ steps.check.outputs.any }}
+
+    steps:
+      - name: 检出构建状态记录
+        uses: actions/checkout@v4
+        with:
+          ref: state
+          path: state
+          # 分支不存在时不报错，后续按空处理
+          continue-on-error: true
+
+      - name: 检测各上游最新提交
+        id: check
+        env:
+          # 手动触发时指定的目标，为空表示自动检测
+          REQ_TARGETS: ${{ inputs.targets }}
+          REQ_SHA: ${{ inputs.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 读取上次记录的提交，没有就当空
+          prev() {
+            local f="state/$1.sha"
+            if [ -f "$f" ]; then cat "$f" | tr -d '[:space:]'; else echo ""; fi
+          }
+
+          # 查上游默认分支最新提交
+          latest() {
+            curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$1/commits?per_page=1" \
+              | python3 -c "import sys,json;d=json.load(sys.stdin);print(d[0]['sha'] if isinstance(d,list) and d else '')"
+          }
+
+          decide() {
+            local name="$1" repo="$2"
+            if [ -n "$REQ_SHA" ]; then
+              echo "$REQ_SHA"
+              return
+            fi
+            latest "$repo"
+          }
+
+          for pair in "backend:lioensky/VCPToolBox" "mobile:MRiecy/VCPMobile" "desktop:lioensky/VCPChat"; do
+            name="${pair%%:*}"
+            repo="${pair#*:}"
+
+            # 手动指定单个目标时，其它目标不构建
+            if [ -n "$REQ_TARGETS" ] && [ "$REQ_TARGETS" != "all" ] && [ "$REQ_TARGETS" != "$name" ]; then
+              echo "$name=skip（手动指定其它目标）"
+              echo "$name=false" >> "$GITHUB_OUTPUT"
+              continue
+            fi
+
+            cur=$(decide "$name" "$repo")
+            old=$(prev "$name")
+
+            if [ -z "$cur" ]; then
+              echo "::warning::$name 无法获取上游提交，跳过"
+              echo "$name=false" >> "$GITHUB_OUTPUT"
+              continue
+            fi
+
+            if [ "$cur" = "$old" ]; then
+              echo "$name=skip（无更新，仍是 ${cur:0:8}）"
+              echo "$name=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "$name=build（${old:0:8} → ${cur:0:8}）"
+              echo "$name=true" >> "$GITHUB_OUTPUT"
+            fi
+            echo "${name}_sha=$cur" >> "$GITHUB_OUTPUT"
+          done
+
+          # 任意一个需要构建就继续
+          b=$(grep -c '^backend=true' <<< "$(grep -E '^(backend|mobile|desktop)=' "$GITHUB_OUTPUT" || true)" || true)
+          m=$(grep -c '^mobile=true' <<< "$(grep -E '^(backend|mobile|desktop)=' "$GITHUB_OUTPUT" || true)" || true)
+          d=$(grep -c '^desktop=true' <<< "$(grep -E '^(backend|mobile|desktop)=' "$GITHUB_OUTPUT" || true)" || true)
+          if [ $((b + m + d)) -gt 0 ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 检测结果
+        run: |
+          {
+            echo "### 上游检测"
+            echo ""
+            echo "| 组件 | 本次 | 上游提交 |"
+            echo "| --- | --- | --- |"
+            echo "| VCPToolBox | ${{ steps.check.outputs.backend }} | \`${{ steps.check.outputs.backend_sha }}\` |"
+            echo "| VCPMobile | ${{ steps.check.outputs.mobile }} | \`${{ steps.check.outputs.mobile_sha }}\` |"
+            echo "| VCPChat | ${{ steps.check.outputs.desktop }} | \`${{ steps.check.outputs.desktop_sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ============ 1. 服务端 ============
   backend:
     name: 构建 VCPToolBox
+    needs: detect
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    if: |
-      github.event_name == 'schedule'
-      || inputs.targets == 'all'
-      || inputs.targets == 'backend'
+    if: needs.detect.outputs.backend == 'true'
 
     steps:
       # 先检出本仓库，拿到构建脚本
@@ -95,12 +204,18 @@ jobs:
         run: |
           cd src
           docker build -t "vcptoolbox:build" . 2>&1 | tail -30
-          # 多标签：带提交号便于回滚，latest 便于直接拉取
+          # 多标签：
+          #   <短hash>   精确对应一次上游提交，回滚用
+          #   <日期>     按天滚动，便于按时间找
+          #   latest     日常拉取
           SHORT="${{ steps.meta.outputs.short }}"
+          DATE_TAG=$(date -u '+%Y%m%d')
           IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox"
           docker tag "vcptoolbox:build" "$IMAGE:$SHORT"
+          docker tag "vcptoolbox:build" "$IMAGE:$DATE_TAG"
           docker tag "vcptoolbox:build" "$IMAGE:latest"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "date_tag=$DATE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: 推送镜像到 Docker Hub
         env:
@@ -116,8 +231,9 @@ jobs:
           echo "登录 Docker Hub"
           echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
           docker push "$IMAGE:$SHORT"
+          docker push "$IMAGE:${{ steps.build.outputs.date_tag }}"
           docker push "$IMAGE:latest"
-          echo "已推送 $IMAGE:$SHORT 与 $IMAGE:latest"
+          echo "已推送 $IMAGE:$SHORT / :${{ steps.build.outputs.date_tag }} / :latest"
 
       - name: 更新 Docker Hub 仓库说明
         env:
@@ -133,9 +249,11 @@ jobs:
 
       - name: 导出镜像
         run: |
-          docker save "vcptoolbox:build" | gzip -1 > "vcptoolbox-${{ steps.meta.outputs.short }}.tar.gz"
+          # 文件名带上日期与上游短 hash，一眼看出是哪次构建
+          NAME="vcptoolbox-$(date -u '+%Y%m%d')-${{ steps.meta.outputs.short }}"
+          docker save "vcptoolbox:build" | gzip -1 > "$NAME.tar.gz"
           ls -lh vcptoolbox-*.tar.gz
-          echo "IMAGE_SHA=$(sha256sum vcptoolbox-*.tar.gz | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "IMAGE_SHA=$(sha256sum "$NAME.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_ENV"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -158,12 +276,10 @@ jobs:
   # ============ 2. 移动端 APK ============
   mobile:
     name: 构建 VCPMobile APK
+    needs: detect
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    if: |
-      github.event_name == 'schedule'
-      || inputs.targets == 'all'
-      || inputs.targets == 'mobile'
+    if: needs.detect.outputs.mobile == 'true'
 
     steps:
       # 先检出本仓库，拿到构建脚本
@@ -176,7 +292,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: MRiecy/VCPMobile
-          ref: ${{ inputs.sha || 'main' }}
+          ref: ${{ needs.detect.outputs.mobile_sha || inputs.sha || 'main' }}
           path: src
           fetch-depth: 1
 
@@ -329,19 +445,17 @@ jobs:
   # ============ 3. 桌面端 ============
   desktop:
     name: 构建 VCPChat 客户端
+    needs: detect
     runs-on: windows-latest
     timeout-minutes: 120
-    if: |
-      github.event_name == 'schedule'
-      || inputs.targets == 'all'
-      || inputs.targets == 'desktop'
+    if: needs.detect.outputs.desktop == 'true'
 
     steps:
       - name: 检出上游源码
         uses: actions/checkout@v4
         with:
           repository: lioensky/VCPChat
-          ref: ${{ inputs.sha || 'main' }}
+          ref: ${{ needs.detect.outputs.desktop_sha || inputs.sha || 'main' }}
           path: src
           fetch-depth: 1
 
@@ -448,8 +562,16 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path out | Out-Null
 
+          $short = "${{ steps.meta.outputs.short }}"
+          $date = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
+
+          # 版本号从上游 package.json 读，缺失时有兜底
+          $ver = "unknown"
+          if (Test-Path "src/package.json") {
+            try { $ver = (Get-Content "src/package.json" -Raw | ConvertFrom-Json).version } catch {}
+          }
+
           # 收集全部二进制成品：安装包、增量更新块、绿色版压缩包
-          # blockmap 虽小，但自动更新需要它，一起带上
           $exts = @('.exe', '.msi', '.msix', '.appx', '.7z', '.zip', '.blockmap', '.yml')
           $files = Get-ChildItem src/dist -File |
             Where-Object { $exts -contains $_.Extension.ToLower() }
@@ -457,17 +579,38 @@ jobs:
           if (-not $files) { throw "未找到安装包产物" }
 
           foreach ($f in $files) {
-            Copy-Item $f.FullName "out/$($f.Name)"
-            Write-Host "$($f.Name) $([math]::Round($f.Length/1MB,2)) MB"
+            $name = $f.Name
+            $ext = $f.Extension.ToLower()
+
+            if ($ext -eq '.exe' -and $name -notmatch 'uninstall') {
+              # 安装包：VCPChat-Setup-<版本>-<短hash>.exe
+              $name = "VCPChat-Setup-$ver-$short.exe"
+            } elseif ($ext -eq '.blockmap') {
+              # 增量更新块必须和安装包同名，跟着改
+              $name = "VCPChat-Setup-$ver-$short.exe.blockmap"
+            } elseif ($ext -eq '.yml') {
+              # 更新描述文件，同样跟着安装包名
+              $name = "VCPChat-Setup-$ver-$short.yml"
+            } else {
+              $base = [IO.Path]::GetFileNameWithoutExtension($f.Name)
+              $name = "$base-$ver-$short$ext"
+            }
+
+            Copy-Item $f.FullName "out/$name"
+            Write-Host "$name $([math]::Round($f.Length/1MB,2)) MB"
           }
 
-          # 顺带打包一份免安装版（win-unpacked），方便不想装的人直接用
+          # 免安装版：VCPChat-Portable-<版本>-<短hash>.zip
           $unpacked = "src/dist/win-unpacked"
           if (Test-Path $unpacked) {
+            $zipName = "VCPChat-Portable-$ver-$short.zip"
             Write-Host "打包免安装版"
-            Compress-Archive -Path "$unpacked/*" -DestinationPath "out/VCPChat-portable.zip" -CompressionLevel Optimal
-            Write-Host "VCPChat-portable.zip $([math]::Round((Get-Item 'out/VCPChat-portable.zip').Length/1MB,1)) MB"
+            Compress-Archive -Path "$unpacked/*" -DestinationPath "out/$zipName" -CompressionLevel Optimal
+            Write-Host "$zipName $([math]::Round((Get-Item "out/$zipName").Length/1MB,1)) MB"
           }
+
+          # 记录版本供发布说明使用
+          "app_version=$ver" >> $env:GITHUB_OUTPUT
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -489,7 +632,7 @@ jobs:
   # ============ 4. 发布 Release ============
   release:
     name: 发布 Release
-    needs: [backend, mobile, desktop]
+    needs: [detect, backend, mobile, desktop]
     if: |
       always()
       && !cancelled()
@@ -536,8 +679,10 @@ jobs:
       - name: 生成校验清单
         run: |
           cd release
-          # 排除清单自身
-          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' | sort | xargs -r sha256sum > SHA256SUMS.txt
+          # 用 find -print0 + xargs -0，文件名含空格也不怕
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -print0 \
+            | sort -z \
+            | xargs -0 -r sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: 生成发布说明
@@ -616,3 +761,37 @@ jobs:
             echo ""
             echo "已发布 [${{ steps.tag.outputs.tag }}](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${{ steps.tag.outputs.tag }})"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # 记录本次构建成功对应的上游提交，下次比对用
+      - name: 保存构建状态
+        if: success()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # state 分支只存状态文件，用孤儿分支避免历史膨胀
+          git fetch origin state 2>/dev/null || true
+          if git rev-parse --verify origin/state >/dev/null 2>&1; then
+            git checkout -B state origin/state
+          else
+            git checkout --orphan state
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          # 只记录本次真正构建成功的组件
+          [ "${{ needs.backend.result }}" = "success" ] && echo "${{ needs.detect.outputs.backend_sha }}" > backend.sha || true
+          [ "${{ needs.mobile.result }}" = "success" ] && echo "${{ needs.detect.outputs.mobile_sha }}" > mobile.sha || true
+          [ "${{ needs.desktop.result }}" = "success" ] && echo "${{ needs.detect.outputs.desktop_sha }}" > desktop.sha || true
+
+          echo "${{ steps.tag.outputs.tag }}" > last-release.txt
+          date -u '+%Y-%m-%d %H:%M UTC' > last-built.txt
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "状态无变化"
+          else
+            git commit -m "state: ${{ steps.tag.outputs.tag }}"
+            git push origin state
+            echo "状态已更新"
+          fi

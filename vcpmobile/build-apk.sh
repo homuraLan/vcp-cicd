@@ -184,12 +184,16 @@ echo "[$(date '+%F %T')] === APK BUILD OK $SHORT"
 VER=$(python3 -c "import json;print(json.load(open('$SRC/src-tauri/tauri.conf.json'))['version'])")
 VCODE=$(python3 -c "import json;print(json.load(open('$SRC/src-tauri/tauri.conf.json'))['bundle']['android']['versionCode'])")
 
-# 固定文件名：App 用固定 URL 拉取，避免版本号变化导致地址失效
+# 两个名字：
+#   VCPMobile-latest.apk        固定名，App 内置这个 URL 做自动更新
+#   VCPMobile-v<版本>-<短hash>.apk  带版本身份，方便归档和回滚
+NAMED="VCPMobile-v${VER}-${SHORT}.apk"
 rm -f "$OUT/VCPMobile-latest.apk"
 set -- "$OUT"/*.apk
 if [ -f "$1" ]; then
   cp -f "$1" "$OUT/VCPMobile-latest.apk"
-  find "$OUT" -maxdepth 1 -name "*.apk" ! -name "VCPMobile-latest.apk" -delete 2>/dev/null || true
+  cp -f "$1" "$OUT/$NAMED"
+  find "$OUT" -maxdepth 1 -name "*.apk" ! -name "VCPMobile-latest.apk" ! -name "$NAMED" -delete 2>/dev/null || true
 fi
 
 APK_SIZE=$(stat -c %s "$OUT/VCPMobile-latest.apk" 2>/dev/null || echo 0)
@@ -200,7 +204,9 @@ cat > "$OUT/manifest.json" <<EOF
   "version": "$VER",
   "versionCode": $VCODE,
   "sha": "$SHA",
+  "short": "$SHORT",
   "apk": "VCPMobile-latest.apk",
+  "named": "$NAMED",
   "size": $APK_SIZE,
   "apk_sha256": "$APK_SHA",
   "server": "$VCP_SERVER_URL",
@@ -211,15 +217,17 @@ EOF
 cat > "$WORK/state.json" <<EOF
 {
   "sha": "$SHA",
+  "short": "$SHORT",
   "version": "$VER",
   "versionCode": $VCODE,
   "apk": "VCPMobile-latest.apk",
+  "named": "$NAMED",
   "built_at": "$(date -Iseconds)"
 }
 EOF
 
 echo "[$(date '+%F %T')] manifest 与 state 已写入"
-echo "[$(date '+%F %T')] APK: $VER (code $VCODE), $(numfmt --to=iec $APK_SIZE 2>/dev/null || echo $APK_SIZE)"
+echo "[$(date '+%F %T')] APK: $NAMED, $(numfmt --to=iec $APK_SIZE 2>/dev/null || echo $APK_SIZE)"
 
 if [ -f "$WORK/template/index.html" ]; then
   cp -f "$WORK/template/index.html" "$OUT/index.html"
