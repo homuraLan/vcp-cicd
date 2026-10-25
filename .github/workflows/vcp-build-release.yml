@@ -428,8 +428,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mobile
+          # 通配符收全部 apk：固定名 + 带版本号的命名副本
           path: |
-            work/out/VCPMobile-latest.apk
+            work/out/*.apk
             work/out/manifest.json
             work/out/index.html
           retention-days: 7
