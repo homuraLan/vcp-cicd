@@ -84,11 +84,16 @@ if [ -d .git ]; then
   [ "$BRANCH" = "HEAD" ] && BRANCH=main
 
   # 上游会 force push 改写历史，--ff-only 必然失败，所以直接对齐远端。
-  # 浅克隆下要 --unshallow 才能拿到完整对象，否则 reset 会缺 blob。
-  if ! git fetch --depth 1 origin "$BRANCH" 2>&1 | tail -3; then
+  # 注意别写成 `git fetch ... | tail`：管道会让 $? 变成 tail 的退出码，
+  # 永远看不到 fetch 真失败。
+  FETCH_LOG=$(mktemp)
+  if ! git fetch --depth 1 origin "$BRANCH" >"$FETCH_LOG" 2>&1; then
+    tail -3 "$FETCH_LOG"
+    rm -f "$FETCH_LOG"
     log "拉取失败，保留当前源码"
     exit 1
   fi
+  rm -f "$FETCH_LOG"
 
   # reset 会覆盖本地对跟踪文件的修改。先留一份，出问题能找回来
   if ! git diff --quiet 2>/dev/null; then

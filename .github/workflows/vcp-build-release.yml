@@ -1020,22 +1020,25 @@ jobs:
           path: ci
 
       - name: 更新客户端
-        # 服务账户（NETWORK SERVICE）的 PATH 里没有 pwsh，只能用系统自带的 5.1
+        # 服务账户（NETWORK SERVICE）的 PATH 里没有 pwsh，只能用系统自带的 5.1。
+        # 注意：5.1 按系统代码页读脚本，这个 run 块里只能写英文 —— 中文会乱码
+        # 并破坏引号配对，报 TerminatorExpectedAtEndOfString。
         shell: powershell
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHAT_DIR: ${{ vars.VCP_CHAT_DIR }}
           TAG: ${{ needs.release.outputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
           if (-not $env:CHAT_DIR) {
-            Write-Host "未配置仓库变量 VCP_CHAT_DIR，跳过"
+            Write-Host "VCP_CHAT_DIR not set, skip"
             exit 0
           }
           if (-not $env:TAG) {
-            Write-Host "没有发布标签，跳过"
+            Write-Host "no release tag, skip"
             exit 0
           }
-          & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo "${{ github.repository }}"
+          & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo $env:REPO
           exit $LASTEXITCODE
 
   summary:
