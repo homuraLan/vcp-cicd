@@ -17,5 +17,4 @@ services:
       - vcp_vectorstore:/usr/src/app/VectorStore
       - /usr/src/app/pydeps
       - /usr/src/app/node_modules
-      # 容器内 new-api 与 172.17.0.1:9000 通信；此处仅作说明
     restart: unless-stopped
