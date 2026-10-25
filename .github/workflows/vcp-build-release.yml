@@ -53,6 +53,12 @@ jobs:
       || inputs.targets == 'backend'
 
     steps:
+      # 先检出本仓库，拿到构建脚本
+      - name: 检出构建脚本
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
       - name: 检出上游源码
         uses: actions/checkout@v4
         with:
@@ -85,9 +91,35 @@ jobs:
           done
 
       - name: 构建镜像
+        id: build
         run: |
           cd src
           docker build -t "vcptoolbox:build" . 2>&1 | tail -30
+          # 多标签：带提交号便于回滚，latest 便于直接拉取
+          SHORT="${{ steps.meta.outputs.short }}"
+          IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox"
+          docker tag "vcptoolbox:build" "$IMAGE:$SHORT"
+          docker tag "vcptoolbox:build" "$IMAGE:latest"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: 推送镜像到 Docker Hub
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        run: |
+          IMAGE="${{ steps.build.outputs.image }}"
+          SHORT="${{ steps.meta.outputs.short }}"
+          echo "登录 Docker Hub"
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          docker push "$IMAGE:$SHORT"
+          docker push "$IMAGE:latest"
+          echo "已推送 $IMAGE:$SHORT 与 $IMAGE:latest"
+
+      - name: 更新 Docker Hub 仓库说明
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.meta.outputs.sha }}
+        run: python3 ci/scripts/update-dockerhub-desc.py
 
       - name: 导出镜像
         run: |
@@ -110,6 +142,7 @@ jobs:
             echo ""
             echo "- 提交: \`${{ steps.meta.outputs.sha }}\`"
             echo "- 镜像归档 SHA256: \`$IMAGE_SHA\`"
+            echo "- Docker Hub: \`${{ steps.build.outputs.image }}:${{ steps.meta.outputs.short }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ============ 2. 移动端 APK ============
@@ -220,7 +253,9 @@ jobs:
           if [ -n "$KEYSTORE_B64" ]; then
             echo "使用仓库配置的签名密钥"
             printf '%s' "$KEYSTORE_B64" | base64 -d > keys/release.jks
-            KEYSTORE_PATH="$GITHUB_WORKSPACE/keys/release.jks" >> "$GITHUB_ENV"
+            test -s keys/release.jks || { echo "::error::密钥解码失败"; exit 1; }
+            echo "KEYSTORE_PATH=$GITHUB_WORKSPACE/keys/release.jks" >> "$GITHUB_ENV"
+            echo "已写入密钥: $(stat -c %s keys/release.jks) 字节"
           else
             echo "::warning::未配置签名密钥，产出未签名 APK，无法覆盖安装旧版本"
           fi
@@ -385,10 +420,16 @@ jobs:
       - name: 构建并打包
         shell: pwsh
         working-directory: src
+        env:
+          # 打包完只产出安装包，发布交给后面的 Release 步骤
+          EP_DISABLE_PUBLISH: "true"
         run: |
           npm run build
           if ($LASTEXITCODE -ne 0) { throw "构建失败" }
-          npm run dist
+
+          # --publish never 阻止 electron-builder 自己往 GitHub 发 Release
+          # （它默认会尝试，缺 token 时在打包完成后报错退出）
+          npx electron-builder --win --x64 --publish never
           if ($LASTEXITCODE -ne 0) { throw "打包失败" }
 
       - name: 收集产物
@@ -396,12 +437,26 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path out | Out-Null
+
+          # 收集全部二进制成品：安装包、增量更新块、绿色版压缩包
+          # blockmap 虽小，但自动更新需要它，一起带上
+          $exts = @('.exe', '.msi', '.msix', '.appx', '.7z', '.zip', '.blockmap', '.yml')
           $files = Get-ChildItem src/dist -File |
-            Where-Object { $_.Length -gt 1MB -and $_.Extension -in '.exe', '.msi', '.7z', '.zip' }
+            Where-Object { $exts -contains $_.Extension.ToLower() }
+
           if (-not $files) { throw "未找到安装包产物" }
+
           foreach ($f in $files) {
             Copy-Item $f.FullName "out/$($f.Name)"
-            Write-Host "$($f.Name) $([math]::Round($f.Length/1MB,1)) MB"
+            Write-Host "$($f.Name) $([math]::Round($f.Length/1MB,2)) MB"
+          }
+
+          # 顺带打包一份免安装版（win-unpacked），方便不想装的人直接用
+          $unpacked = "src/dist/win-unpacked"
+          if (Test-Path $unpacked) {
+            Write-Host "打包免安装版"
+            Compress-Archive -Path "$unpacked/*" -DestinationPath "out/VCPChat-portable.zip" -CompressionLevel Optimal
+            Write-Host "VCPChat-portable.zip $([math]::Round((Get-Item 'out/VCPChat-portable.zip').Length/1MB,1)) MB"
           }
 
       - name: 上传产物
@@ -449,26 +504,30 @@ jobs:
       - name: 整理产物
         run: |
           mkdir -p release
-          # 每个 artifact 一个子目录，全部摊平到 release/
+          # 只收二进制成品与校验清单，跳过下载页用的 html
           for d in artifacts/*/; do
             name=$(basename "$d")
-            find "$d" -type f | while read -r f; do
+            find "$d" -type f \
+              \( -name '*.apk' -o -name '*.exe' -o -name '*.msi' -o -name '*.msix' \
+                 -o -name '*.7z' -o -name '*.zip' -o -name '*.blockmap' \
+                 -o -name '*.tar.gz' -o -name '*.yml' -o -name '*.json' \) | while read -r f; do
               base=$(basename "$f")
-              # 同名文件加前缀避免互相覆盖
               dest="release/$base"
+              # 同名文件加来源前缀，避免互相覆盖
               if [ -f "$dest" ]; then
                 dest="release/${name}-${base}"
               fi
               cp "$f" "$dest"
             done
           done
-          rm -f release/.keep
-          ls -lh release/
+          echo "=== 收集到的成品"
+          find release -type f -printf '%10s  %p\n' | sort -k2
 
       - name: 生成校验清单
         run: |
           cd release
-          sha256sum * > SHA256SUMS.txt 2>/dev/null || true
+          # 排除清单自身
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' | sort | xargs -r sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: 生成发布说明
@@ -484,13 +543,48 @@ jobs:
             echo "| 移动端 VCPMobile | ${{ needs.mobile.result }} |"
             echo "| 桌面端 VCPChat | ${{ needs.desktop.result }} |"
             echo ""
-            echo "### 安装"
+            echo "### 下载"
             echo ""
-            echo "- **Android**: 下载 \`VCPMobile-latest.apk\` 安装"
-            echo "- **Windows**: 下载 \`*.exe\` 安装包"
-            echo "- **服务端**: \`docker load < vcptoolbox-*.tar.gz\`"
+
+            if ls release/*.apk >/dev/null 2>&1; then
+              echo "**Android**"
+              echo ""
+              for f in release/*.apk; do
+                echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"
+              done
+              echo ""
+            fi
+
+            if ls release/*.exe release/*.zip release/*.msi >/dev/null 2>&1; then
+              echo "**Windows**"
+              echo ""
+              for f in release/*.exe release/*.zip release/*.msi; do
+                [ -f "$f" ] || continue
+                echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"
+              done
+              echo ""
+            fi
+
+            if ls release/*.tar.gz >/dev/null 2>&1; then
+              echo "**服务端**"
+              echo ""
+              for f in release/*.tar.gz; do
+                echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"
+              done
+              echo ""
+              echo '```bash'
+              echo 'gunzip -c vcptoolbox-*.tar.gz | docker load'
+              echo '```'
+              echo ""
+              echo "或直接拉取：\`docker pull ${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox:latest\`"
+              echo ""
+            fi
+
+            echo "### 校验"
             echo ""
-            echo "校验：\`sha256sum -c SHA256SUMS.txt\`"
+            echo '```bash'
+            echo 'sha256sum -c SHA256SUMS.txt'
+            echo '```'
           } > RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
