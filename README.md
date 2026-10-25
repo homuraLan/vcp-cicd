@@ -65,11 +65,20 @@
 
 ### VCPToolBox · 服务端
 
+<a href="https://hub.docker.com/r/homuralan/vcptoolbox"><img src="https://img.shields.io/docker/pulls/homuralan/vcptoolbox?style=flat-square&logo=docker&logoColor=white" alt="docker pulls"></a>
+
 ```bash
 docker pull homuralan/vcptoolbox:latest
 ```
 
+| Tag | 说明 |
+| :--- | :--- |
+| `latest` | 最近一次成功构建 |
+| `20261025` 这样的日期 | 当天构建的版本 |
+| `dd4f7032` 这样的短 hash | 精确对应某个上游提交，回滚用 |
+
 需要配置文件才能启动。参考上游 [VCPToolBox](https://github.com/lioensky/VCPToolBox) 的部署说明。
+镜像说明会随每次构建自动更新到 Docker Hub 页面。
 
 ## 更新方式
 
