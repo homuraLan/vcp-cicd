@@ -1,0 +1,489 @@
+name: VCP Build & Release
+
+# 三端构建全部在 GitHub 托管 runner 上完成，产物统一发布到 GitHub Release。
+#
+#   backend  —— VCPToolBox Docker 镜像（构建并导出镜像归档）
+#   mobile   —— VCPMobile Android APK（ubuntu 上交叉编译）
+#   desktop  —— VCPChat Windows 客户端（windows 上原生构建）
+#
+# 局域网分发：workflow 结束后由 NAS 上的同步任务把 Release 产物拉到本地目录，
+# 手机和 PC 从局域网地址下载更新。
+#
+# 所有版本号集中在 vars 里，不写死路径与地址。
+
+on:
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: '构建目标'
+        required: false
+        type: choice
+        default: all
+        options:
+          - all
+          - backend
+          - mobile
+          - desktop
+      sha:
+        description: '上游提交 SHA（留空 = 最新）'
+        required: false
+        type: string
+
+  # 定时检测上游更新
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vcp-build-release
+  cancel-in-progress: false
+
+jobs:
+  # ============ 1. 服务端 ============
+  backend:
+    name: 构建 VCPToolBox
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: |
+      github.event_name == 'schedule'
+      || inputs.targets == 'all'
+      || inputs.targets == 'backend'
+
+    steps:
+      - name: 检出上游源码
+        uses: actions/checkout@v4
+        with:
+          repository: lioensky/VCPToolBox
+          ref: ${{ inputs.sha || 'main' }}
+          path: src
+          fetch-depth: 1
+
+      - name: 记录版本
+        id: meta
+        run: |
+          SHA=$(git -C src rev-parse HEAD)
+          SHORT=${SHA:0:8}
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "服务端提交: $SHA"
+
+      - name: 准备构建上下文
+        run: |
+          # 上游 Dockerfile 的 COPY 漏了运行所需目录，补上
+          cd src
+          for d in TVStxt ToolConfigs config; do
+            if [ -d "$d" ]; then
+              echo "存在: $d"
+            else
+              echo "补空目录: $d"
+              mkdir -p "$d"
+              touch "$d/.keep"
+            fi
+          done
+
+      - name: 构建镜像
+        run: |
+          cd src
+          docker build -t "vcptoolbox:build" . 2>&1 | tail -30
+
+      - name: 导出镜像
+        run: |
+          docker save "vcptoolbox:build" | gzip -1 > "vcptoolbox-${{ steps.meta.outputs.short }}.tar.gz"
+          ls -lh vcptoolbox-*.tar.gz
+          echo "IMAGE_SHA=$(sha256sum vcptoolbox-*.tar.gz | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend
+          path: vcptoolbox-*.tar.gz
+          retention-days: 7
+          compression-level: 0
+
+      - name: 汇总
+        run: |
+          {
+            echo "### 服务端"
+            echo ""
+            echo "- 提交: \`${{ steps.meta.outputs.sha }}\`"
+            echo "- 镜像归档 SHA256: \`$IMAGE_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============ 2. 移动端 APK ============
+  mobile:
+    name: 构建 VCPMobile APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: |
+      github.event_name == 'schedule'
+      || inputs.targets == 'all'
+      || inputs.targets == 'mobile'
+
+    steps:
+      - name: 检出上游源码
+        uses: actions/checkout@v4
+        with:
+          repository: MRiecy/VCPMobile
+          ref: ${{ inputs.sha || 'main' }}
+          path: src
+          fetch-depth: 1
+
+      - name: 记录版本
+        id: meta
+        run: |
+          SHA=$(git -C src rev-parse HEAD)
+          SHORT=${SHA:0:8}
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "移动端提交: $SHA"
+
+      # 工具链版本由上游 .github/toolchain.env 提供，单一下游不重复维护
+      - name: 载入工具链版本
+        run: |
+          if [ -f src/.github/toolchain.env ]; then
+            grep -E '^[A-Za-z_][A-Za-z0-9_]*=' src/.github/toolchain.env >> "$GITHUB_ENV"
+          fi
+          # 兜底默认值（上游文件缺失时）
+          : "${NODE_VERSION:=24.14.1}" && echo "NODE_VERSION=$NODE_VERSION" >> "$GITHUB_ENV"
+          : "${PNPM_VERSION:=12.6.0}" && echo "PNPM_VERSION=$PNPM_VERSION" >> "$GITHUB_ENV"
+          : "${JAVA_VERSION:=17}" && echo "JAVA_VERSION=$JAVA_VERSION" >> "$GITHUB_ENV"
+          : "${ANDROID_COMPILE_SDK_VERSION:=36}" && echo "ANDROID_COMPILE_SDK_VERSION=$ANDROID_COMPILE_SDK_VERSION" >> "$GITHUB_ENV"
+          : "${ANDROID_BUILD_TOOLS_VERSION:=36.0.0}" && echo "ANDROID_BUILD_TOOLS_VERSION=$ANDROID_BUILD_TOOLS_VERSION" >> "$GITHUB_ENV"
+          : "${NDK_VERSION:=29.0.14206865}" && echo "NDK_VERSION=$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 安装 pnpm
+        run: |
+          npm install -g "pnpm@${PNPM_VERSION}"
+          pnpm --version
+
+      - name: 安装 JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: 安装 Android SDK
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+          yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-${ANDROID_COMPILE_SDK_VERSION}" \
+            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
+            "ndk;${NDK_VERSION}"
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: 缓存 Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/src-tauri
+
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('src/src-tauri/gen/android/**/*.gradle*', 'src/src-tauri/gen/android/**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: 准备签名密钥
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          mkdir -p keys
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "使用仓库配置的签名密钥"
+            printf '%s' "$KEYSTORE_B64" | base64 -d > keys/release.jks
+            KEYSTORE_PATH="$GITHUB_WORKSPACE/keys/release.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::未配置签名密钥，产出未签名 APK，无法覆盖安装旧版本"
+          fi
+
+      - name: 构建 APK
+        env:
+          VCP_SERVER_URL: ${{ vars.VCP_SERVER_URL }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$VCP_SERVER_URL" ]; then
+            echo "::error::未配置仓库变量 VCP_SERVER_URL"
+            exit 1
+          fi
+          mkdir -p work
+          WORK="$GITHUB_WORKSPACE/work" \
+          BUILD_MODE=host \
+          VCP_SERVER_URL="$VCP_SERVER_URL" \
+          KEY_ALIAS="$ANDROID_KEY_ALIAS" \
+          KEY_PASS="$ANDROID_KEYSTORE_PASSWORD" \
+          KEYSTORE_PATH="${KEYSTORE_PATH:-}" \
+          DOWNLOAD_URL="${{ vars.VCP_APK_URL }}" \
+            bash vcpmobile/build-apk.sh
+
+      - name: 校验产物
+        run: |
+          APK="work/out/VCPMobile-latest.apk"
+          test -f "$APK" || { echo "::error::未产出 APK"; exit 1; }
+          ls -lh "$APK"
+          # 有签名就验证，没签名只提示
+          BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS_VERSION}"
+          if [ -f "$KEYSTORE_PATH" ] && [ -x "$BUILD_TOOLS/apksigner" ]; then
+            "$BUILD_TOOLS/apksigner" verify --print-certs "$APK" | head -5
+          else
+            echo "未签名，跳过签名校验"
+          fi
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile
+          path: |
+            work/out/VCPMobile-latest.apk
+            work/out/manifest.json
+            work/out/index.html
+          retention-days: 7
+          compression-level: 0
+
+      - name: 汇总
+        run: |
+          {
+            echo "### 移动端 APK"
+            echo ""
+            echo '```json'
+            cat work/out/manifest.json 2>/dev/null || echo '{}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============ 3. 桌面端 ============
+  desktop:
+    name: 构建 VCPChat 客户端
+    runs-on: windows-latest
+    timeout-minutes: 120
+    if: |
+      github.event_name == 'schedule'
+      || inputs.targets == 'all'
+      || inputs.targets == 'desktop'
+
+    steps:
+      - name: 检出上游源码
+        uses: actions/checkout@v4
+        with:
+          repository: lioensky/VCPChat
+          ref: ${{ inputs.sha || 'main' }}
+          path: src
+          fetch-depth: 1
+
+      - name: 记录版本
+        id: meta
+        shell: pwsh
+        run: |
+          $sha = (git -C src rev-parse HEAD).Trim()
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short=$($sha.Substring(0,8))" >> $env:GITHUB_OUTPUT
+          Write-Host "桌面端提交: $sha"
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src/rust_chat_data_service -> target
+            src/rust_voice_input_engine -> target
+            src/rust_projectforge_indexer -> target
+
+      - name: 安装依赖
+        shell: pwsh
+        working-directory: src
+        run: |
+          npm ci --omit=optional
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "npm ci 失败，回退到 npm install"
+            npm install
+          }
+
+      - name: 修正原生模块编译配置
+        shell: pwsh
+        working-directory: src
+        run: |
+          # node-pty 强制要求 Spectre 缓解库，托管 runner 上不一定装了 VS 组件，
+          # 直接在 gyp 里关掉，避免 MSB8040
+          $gypFiles = @(
+            "node_modules/node-pty/binding.gyp",
+            "node_modules/node-pty/deps/winpty/src/winpty.gyp"
+          )
+          foreach ($p in $gypFiles) {
+            if (-not (Test-Path $p)) { continue }
+            $t = Get-Content $p -Raw
+            if ($t -match "'SpectreMitigation':\s*'Spectre'") {
+              $t = $t -replace "'SpectreMitigation':\s*'Spectre'", "'SpectreMitigation': 'false'"
+              [System.IO.File]::WriteAllText((Resolve-Path $p), $t, (New-Object System.Text.UTF8Encoding($false)))
+              Write-Host "已关闭 Spectre 检查: $(Split-Path $p -Leaf)"
+            }
+          }
+
+          # npm ci --omit=optional 会跳过 sharp 的平台二进制，
+          # 而打包阶段的 runtime closure 校验会因为缺二进制而失败
+          if (Test-Path "node_modules/sharp") {
+            if (-not (Test-Path "node_modules/@img/sharp-win32-x64")) {
+              Write-Host "补装 sharp 的 win32-x64 二进制"
+              npm install --no-save @img/sharp-win32-x64
+            }
+          }
+
+      - name: 构建并打包
+        shell: pwsh
+        working-directory: src
+        run: |
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw "构建失败" }
+          npm run dist
+          if ($LASTEXITCODE -ne 0) { throw "打包失败" }
+
+      - name: 收集产物
+        id: collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $files = Get-ChildItem src/dist -File |
+            Where-Object { $_.Length -gt 1MB -and $_.Extension -in '.exe', '.msi', '.7z', '.zip' }
+          if (-not $files) { throw "未找到安装包产物" }
+          foreach ($f in $files) {
+            Copy-Item $f.FullName "out/$($f.Name)"
+            Write-Host "$($f.Name) $([math]::Round($f.Length/1MB,1)) MB"
+          }
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop
+          path: out/*
+          retention-days: 7
+          compression-level: 0
+
+      - name: 汇总
+        shell: pwsh
+        run: |
+          "### 桌面端" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          Get-ChildItem out -File | ForEach-Object {
+            "- $($_.Name) ($([math]::Round($_.Length/1MB,1)) MB)" >> $env:GITHUB_STEP_SUMMARY
+          }
+
+  # ============ 4. 发布 Release ============
+  release:
+    name: 发布 Release
+    needs: [backend, mobile, desktop]
+    if: |
+      always()
+      && !cancelled()
+      && (needs.backend.result == 'success' || needs.mobile.result == 'success' || needs.desktop.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 生成版本标签
+        id: tag
+        run: |
+          # 用日期 + 运行号，保证唯一且可排序
+          TAG="v$(date -u '+%Y.%m.%d')-${GITHUB_RUN_NUMBER}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "本次标签: $TAG"
+
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 整理产物
+        run: |
+          mkdir -p release
+          # 每个 artifact 一个子目录，全部摊平到 release/
+          for d in artifacts/*/; do
+            name=$(basename "$d")
+            find "$d" -type f | while read -r f; do
+              base=$(basename "$f")
+              # 同名文件加前缀避免互相覆盖
+              dest="release/$base"
+              if [ -f "$dest" ]; then
+                dest="release/${name}-${base}"
+              fi
+              cp "$f" "$dest"
+            done
+          done
+          rm -f release/.keep
+          ls -lh release/
+
+      - name: 生成校验清单
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS.txt 2>/dev/null || true
+          cat SHA256SUMS.txt
+
+      - name: 生成发布说明
+        run: |
+          {
+            echo "## VCP 自动构建"
+            echo ""
+            echo "构建时间: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo ""
+            echo "| 组件 | 状态 |"
+            echo "| --- | --- |"
+            echo "| 服务端 VCPToolBox | ${{ needs.backend.result }} |"
+            echo "| 移动端 VCPMobile | ${{ needs.mobile.result }} |"
+            echo "| 桌面端 VCPChat | ${{ needs.desktop.result }} |"
+            echo ""
+            echo "### 安装"
+            echo ""
+            echo "- **Android**: 下载 \`VCPMobile-latest.apk\` 安装"
+            echo "- **Windows**: 下载 \`*.exe\` 安装包"
+            echo "- **服务端**: \`docker load < vcptoolbox-*.tar.gz\`"
+            echo ""
+            echo "校验：\`sha256sum -c SHA256SUMS.txt\`"
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body_path: RELEASE_NOTES.md
+          files: release/*
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
+
+      - name: 汇总
+        run: |
+          {
+            echo "### 发布"
+            echo ""
+            echo "已发布 [${{ steps.tag.outputs.tag }}](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${{ steps.tag.outputs.tag }})"
+          } >> "$GITHUB_STEP_SUMMARY"

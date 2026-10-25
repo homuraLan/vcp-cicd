@@ -3,39 +3,45 @@
 #
 # 配置注入方式：仅改 Rust 侧默认值（settings_manager.rs 的 vcp_server_url 等），
 # 不触碰任何业务逻辑。首次启动即带好服务地址，用户仍可在设置里改。
+#
+# 两种构建模式：
+#   BUILD_MODE=docker    在容器内构建（本地/自托管 runner）
+#   BUILD_MODE=host      直接在宿主环境构建（GitHub 托管 runner，工具链已预装）
+#
+# 签名是可选的：不提供签名时产出未签名 APK，仅用于验证构建。
+# 正式分发必须签名，否则无法覆盖安装旧版本。
 
 set -euo pipefail
 
-# 工作目录由调用方提供，脚本本身不假设任何具体路径
 WORK=${WORK:?请设置 WORK 环境变量指向构建工作目录}
+BUILD_MODE=${BUILD_MODE:-docker}
 SRC=$WORK/src
 OUT=$WORK/out
 LOG_DIR=$WORK/logs
 IMAGE=${IMAGE:-vcpmobile-android:latest}
 
 # ---- 注入的配置 ----
-# 服务地址必须由调用方提供：这是部署环境相关的值，不写死在代码里
-VCP_SERVER_URL=${VCP_SERVER_URL:?请设置 VCP_SERVER_URL 为被测服务端的地址}
+VCP_SERVER_URL=${VCP_SERVER_URL:?请设置 VCP_SERVER_URL 为服务端地址}
 VCP_API_KEY=${VCP_API_KEY:-}
 ADMIN_USER=${ADMIN_USER:-}
 ADMIN_PASS=${ADMIN_PASS:-}
 
-# 分发地址仅用于输出提示，可选
 DOWNLOAD_URL=${DOWNLOAD_URL:-}
+VERSION_CODE_OFFSET=${VERSION_CODE_OFFSET:-0}
 
-# ---- 签名配置（必须由调用方提供，绝不设默认值）----
-KEY_ALIAS=${KEY_ALIAS:?请设置 KEY_ALIAS 为签名密钥别名}
-KEY_PASS=${KEY_PASS:?请设置 KEY_PASS 为签名密钥口令}
+# ---- 签名配置（可选）----
+KEY_ALIAS=${KEY_ALIAS:-}
+KEY_PASS=${KEY_PASS:-}
+# keystore 文件路径；为空表示不签名
+KEYSTORE_PATH=${KEYSTORE_PATH:-}
 
 mkdir -p "$OUT" "$LOG_DIR"
 
 SHA=$(git -C "$SRC" rev-parse HEAD)
 SHORT=${SHA:0:8}
-STAMP=$(date '+%Y%m%d-%H%M%S')
-LOG=$LOG_DIR/build-$SHORT.log
 
-exec > >(tee -a "$LOG") 2>&1
-echo "[$(date '+%F %T')] === APK BUILD START $SHA"
+exec > >(tee -a "$LOG_DIR/build-$SHORT.log") 2>&1
+echo "[$(date '+%F %T')] === APK BUILD START $SHA (mode=$BUILD_MODE)"
 
 # ---- 注入配置（幂等：先还原再替换）----
 SETTINGS=$SRC/src-tauri/src/vcp_modules/infra/settings_manager.rs
@@ -66,80 +72,114 @@ PY
 
 echo "[$(date '+%F %T')] 配置注入完成"
 
-# ---- 版本号：附加构建标识，避免与上游版本混淆 ----
-VERSION_CODE_OFFSET=${VERSION_CODE_OFFSET:-0}
+# ---- 版本号偏移 ----
 python3 - "$SRC" "$VERSION_CODE_OFFSET" <<'PY'
 import json, sys
 src, off = sys.argv[1], int(sys.argv[2])
-p = src + '/src-tauri/tauri.conf.json'
-d = json.load(open(p, encoding='utf-8'))
-b = d.setdefault('bundle', {}).setdefault('android', {})
-base = b.get('versionCode', 1)
-b['versionCode'] = base + off
-print(f"versionCode: {base} -> {b['versionCode']}")
-json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+if off:
+    p = src + '/src-tauri/tauri.conf.json'
+    d = json.load(open(p, encoding='utf-8'))
+    b = d.setdefault('bundle', {}).setdefault('android', {})
+    base = b.get('versionCode', 1)
+    b['versionCode'] = base + off
+    json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+    print(f"versionCode: {base} -> {b['versionCode']}")
 PY
 
 # ---- 构建 ----
-echo "[$(date '+%F %T')] 开始容器内构建"
-mkdir -p "$WORK/gradle-home" "$WORK/.cargo-registry"
-cp -f "$WORK/gradle-init/init-mirror.gradle" "$WORK/gradle-home/" 2>/dev/null || true
+if [ "$BUILD_MODE" = "docker" ]; then
+  echo "[$(date '+%F %T')] 容器内构建"
+  mkdir -p "$WORK/gradle-home" "$WORK/.cargo-registry"
+  cp -f "$WORK/gradle-init/init-mirror.gradle" "$WORK/gradle-home/" 2>/dev/null || true
 
-docker run --rm \
-  -v "$SRC":/workspace \
-  -v "$OUT":/out \
-  -v "$WORK/gradle-home":/root/.gradle \
-  -v "$WORK/.cargo-registry":/usr/local/cargo/registry \
-  -v "$WORK/keys":/keys:ro \
-  -e TARGET_SHA="$SHA" \
-  -e ANDROID_KEYSTORE_PATH=/keys/vcpmobile.jks \
-  -e ANDROID_KEY_ALIAS="${KEY_ALIAS}" \
-  -e ANDROID_KEYSTORE_PASSWORD="${KEY_PASS}" \
-  -e ANDROID_KEY_PASSWORD="${KEY_PASS}" \
-  -w /workspace \
-  "$IMAGE" bash -c '
-    set -euo pipefail
-    export CARGO_NET_GIT_FETCH_WITH_CLI=true
+  KEYSTORE_ARGS=()
+  KEY_ENV=()
+  if [ -n "$KEYSTORE_PATH" ] && [ -f "$KEYSTORE_PATH" ]; then
+    KEYSTORE_ARGS=(-v "$(dirname "$KEYSTORE_PATH")":/keys:ro)
+    KEY_ENV=(-e ANDROID_KEYSTORE_PATH=/keys/$(basename "$KEYSTORE_PATH")
+             -e ANDROID_KEY_ALIAS="$KEY_ALIAS"
+             -e ANDROID_KEYSTORE_PASSWORD="$KEY_PASS"
+             -e ANDROID_KEY_PASSWORD="$KEY_PASS")
+  fi
 
-    # Gradle 使用国内镜像（解决 Maven 403/缓慢）
-    GRADLE_INIT=""
-    if [ -f /root/.gradle/init-mirror.gradle ]; then
-      mkdir -p /root/.gradle/init.d
-      cp /root/.gradle/init-mirror.gradle /root/.gradle/init.d/
-      GRADLE_INIT="--init-script /root/.gradle/init.d/init-mirror.gradle"
-      echo "--- 已加载 Maven 镜像"
-    fi
+  docker run --rm \
+    -v "$SRC":/workspace \
+    -v "$OUT":/out \
+    -v "$WORK/gradle-home":/root/.gradle \
+    -v "$WORK/.cargo-registry":/usr/local/cargo/registry \
+    "${KEYSTORE_ARGS[@]}" \
+    -e TARGET_SHA="$SHA" \
+    "${KEY_ENV[@]}" \
+    -w /workspace \
+    "$IMAGE" bash -c '
+      set -euo pipefail
+      export CARGO_NET_GIT_FETCH_WITH_CLI=true
 
-    echo "--- 依赖安装"
-    if [ -f pnpm-lock.yaml ]; then
-      pnpm install --frozen-lockfile --prefer-offline
-    else
-      pnpm install --prefer-offline
-    fi
+      if [ -f /root/.gradle/init-mirror.gradle ]; then
+        mkdir -p /root/.gradle/init.d
+        cp /root/.gradle/init-mirror.gradle /root/.gradle/init.d/
+        echo "--- 已加载 Maven 镜像"
+      fi
 
-    echo "--- tauri android init"
-    if [ ! -d src-tauri/gen/android ]; then
-      pnpm tauri android init --ci
-    fi
+      echo "--- 依赖安装"
+      if [ -f pnpm-lock.yaml ]; then
+        pnpm install --frozen-lockfile --prefer-offline
+      else
+        pnpm install --prefer-offline
+      fi
 
-    echo "--- android settings"
-    pnpm ci:prepare-android-settings || true
+      echo "--- tauri android init"
+      if [ ! -d src-tauri/gen/android ]; then
+        pnpm tauri android init --ci
+      fi
 
-    echo "--- 编译 APK (aarch64)"
-    pnpm tauri android build --apk --target aarch64
+      echo "--- android settings"
+      pnpm ci:prepare-android-settings || true
 
-    echo "--- 收集产物"
-    found=$(find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" -type f | sort)
-    echo "$found"
-    for f in $found; do
-      cp "$f" /out/
-    done
-    ls -lh /out/
-  '
+      echo "--- 编译 APK"
+      pnpm tauri android build --apk --target aarch64
+
+      found=$(find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" -type f | sort)
+      echo "$found"
+      for f in $found; do cp "$f" /out/; done
+      ls -lh /out/
+    '
+
+else
+  echo "[$(date '+%F %T')] 宿主环境构建"
+  cd "$SRC"
+  export CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+  echo "--- 依赖安装"
+  if [ -f pnpm-lock.yaml ]; then
+    pnpm install --frozen-lockfile
+  else
+    pnpm install
+  fi
+
+  echo "--- tauri android init"
+  if [ ! -d src-tauri/gen/android ]; then
+    pnpm tauri android init --ci
+  fi
+
+  echo "--- android settings"
+  pnpm ci:prepare-android-settings || true
+
+  # 托管 runner 的 gradlew 可能没有执行位
+  chmod +x src-tauri/gen/android/gradlew 2>/dev/null || true
+
+  echo "--- 编译 APK"
+  pnpm tauri android build --apk --target aarch64
+
+  found=$(find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" -type f | sort)
+  echo "$found"
+  for f in $found; do cp "$f" "$OUT/"; done
+  ls -lh "$OUT/"
+fi
 
 echo "[$(date '+%F %T')] === APK BUILD OK $SHORT"
 
-# ---- 发布到 NAS 下载目录 ----
+# ---- 规范化产物 ----
 VER=$(python3 -c "import json;print(json.load(open('$SRC/src-tauri/tauri.conf.json'))['version'])")
 VCODE=$(python3 -c "import json;print(json.load(open('$SRC/src-tauri/tauri.conf.json'))['bundle']['android']['versionCode'])")
 
@@ -148,7 +188,6 @@ rm -f "$OUT/VCPMobile-latest.apk"
 set -- "$OUT"/*.apk
 if [ -f "$1" ]; then
   cp -f "$1" "$OUT/VCPMobile-latest.apk"
-  # 只保留带版本号的那份和 latest 软链副本，清理旧版本
   find "$OUT" -maxdepth 1 -name "*.apk" ! -name "VCPMobile-latest.apk" -delete 2>/dev/null || true
 fi
 
@@ -168,7 +207,6 @@ cat > "$OUT/manifest.json" <<EOF
 }
 EOF
 
-# workflow 用的状态文件
 cat > "$WORK/state.json" <<EOF
 {
   "sha": "$SHA",
@@ -182,11 +220,9 @@ EOF
 echo "[$(date '+%F %T')] manifest 与 state 已写入"
 echo "[$(date '+%F %T')] APK: $VER (code $VCODE), $(numfmt --to=iec $APK_SIZE 2>/dev/null || echo $APK_SIZE)"
 
-# 下载页（模板放 template/，每次发布复制过去）
 if [ -f "$WORK/template/index.html" ]; then
   cp -f "$WORK/template/index.html" "$OUT/index.html"
 fi
 
-# fnOS 下目录常出现 d--------- 权限，nginx 读不到，统一修正
 chmod -R u+rwX,go+rX "$OUT" 2>/dev/null || true
-echo "[$(date '+%F %T')] 权限已修正${DOWNLOAD_URL:+，可通过 $DOWNLOAD_URL 下载}"
+echo "[$(date '+%F %T')] 完成${DOWNLOAD_URL:+，可通过 $DOWNLOAD_URL 下载}"
