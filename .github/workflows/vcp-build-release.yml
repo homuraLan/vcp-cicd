@@ -60,13 +60,20 @@ jobs:
       any: ${{ steps.check.outputs.any }}
 
     steps:
-      - name: 检出构建状态记录
-        uses: actions/checkout@v4
-        with:
-          ref: state
-          path: state
-          # 分支不存在时不报错，后续按空处理
-          continue-on-error: true
+      # state 分支可能还不存在，所以不用 checkout action，
+      # 直接 clone 一次，失败就当作没有历史记录
+      - name: 读出上次构建的提交
+        id: prev
+        run: |
+          set -euo pipefail
+          mkdir -p state
+          REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          if git clone --depth 1 --branch state "$REPO_URL" state 2>/dev/null; then
+            echo "已有状态记录"
+            cat state/*.sha 2>/dev/null || true
+          else
+            echo "首次运行，没有状态记录，将构建全部组件"
+          fi
 
       - name: 检测各上游最新提交
         id: check
@@ -81,7 +88,7 @@ jobs:
           # 读取上次记录的提交，没有就当空
           prev() {
             local f="state/$1.sha"
-            if [ -f "$f" ]; then cat "$f" | tr -d '[:space:]'; else echo ""; fi
+            if [ -f "$f" ]; then tr -d '[:space:]' < "$f"; else echo ""; fi
           }
 
           # 查上游默认分支最新提交
@@ -101,6 +108,8 @@ jobs:
             latest "$repo"
           }
 
+          # 循环里累计，任意一个需要构建就继续
+          ANY=false
           for pair in "backend:lioensky/VCPToolBox" "mobile:MRiecy/VCPMobile" "desktop:lioensky/VCPChat"; do
             name="${pair%%:*}"
             repo="${pair#*:}"
@@ -127,19 +136,13 @@ jobs:
             else
               echo "$name=build（${old:0:8} → ${cur:0:8}）"
               echo "$name=true" >> "$GITHUB_OUTPUT"
+              ANY=true
             fi
             echo "${name}_sha=$cur" >> "$GITHUB_OUTPUT"
           done
 
-          # 任意一个需要构建就继续
-          b=$(grep -c '^backend=true' <<< "$(grep -E '^(backend|mobile|desktop)=' "$GITHUB_OUTPUT" || true)" || true)
-          m=$(grep -c '^mobile=true' <<< "$(grep -E '^(backend|mobile|desktop)=' "$GITHUB_OUTPUT" || true)" || true)
-          d=$(grep -c '^desktop=true' <<< "$(grep -E '^(backend|mobile|desktop)=' "$GITHUB_OUTPUT" || true)" || true)
-          if [ $((b + m + d)) -gt 0 ]; then
-            echo "any=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "any=false" >> "$GITHUB_OUTPUT"
-          fi
+          echo "any=$ANY" >> "$GITHUB_OUTPUT"
+          echo "总体: any=$ANY"
 
       - name: 检测结果
         run: |
@@ -767,16 +770,27 @@ jobs:
         if: success()
         run: |
           set -euo pipefail
+
+          # 在独立目录操作，不干扰工作区
+          WORK=$(mktemp -d)
+          cd "$WORK"
+          git init -q
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # state 分支只存状态文件，用孤儿分支避免历史膨胀
-          git fetch origin state 2>/dev/null || true
-          if git rev-parse --verify origin/state >/dev/null 2>&1; then
-            git checkout -B state origin/state
+          REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          # state 分支只存状态文件，独立成孤儿分支避免历史膨胀
+          if git clone --depth 1 --branch state "$REPO_URL" . 2>/dev/null; then
+            echo "基于现有状态更新"
           else
-            git checkout --orphan state
-            git rm -rf . >/dev/null 2>&1 || true
+            echo "首次创建状态分支"
+            rm -rf ./* ./.git 2>/dev/null || true
+            git init -q
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git remote add origin "$REPO_URL"
+            git checkout -q --orphan state
           fi
 
           # 只记录本次真正构建成功的组件
@@ -788,10 +802,10 @@ jobs:
           date -u '+%Y-%m-%d %H:%M UTC' > last-built.txt
 
           git add -A
-          if git diff --cached --quiet; then
+          if git diff --cached --quiet && git rev-parse --verify HEAD >/dev/null 2>&1; then
             echo "状态无变化"
           else
-            git commit -m "state: ${{ steps.tag.outputs.tag }}"
+            git commit -q -m "state: ${{ steps.tag.outputs.tag }}"
             git push origin state
             echo "状态已更新"
           fi
