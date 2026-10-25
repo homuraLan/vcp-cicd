@@ -771,25 +771,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 在独立目录操作，不干扰工作区
           WORK=$(mktemp -d)
           cd "$WORK"
           git init -q
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
 
-          REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-
-          # state 分支只存状态文件，独立成孤儿分支避免历史膨胀
-          if git clone --depth 1 --branch state "$REPO_URL" . 2>/dev/null; then
-            echo "基于现有状态更新"
+          # 先明确探测远端有没有 state 分支，不要把「clone 失败」和「分支不存在」混为一谈
+          if git ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
+            echo "已有状态分支，基于它更新"
+            git fetch -q --depth 1 origin state
+            git checkout -q -B state FETCH_HEAD
           else
             echo "首次创建状态分支"
-            rm -rf ./* ./.git 2>/dev/null || true
-            git init -q
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git remote add origin "$REPO_URL"
             git checkout -q --orphan state
           fi
 
