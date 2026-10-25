@@ -1,552 +1,427 @@
-# 详细配置教程
+# 自托管 runner 搭建教程
 
-从零开始把 VCP 三端构建搬到 GitHub Actions，并把成品分发到局域网。跟着做大约 30 分钟。
+在自己机器上跑构建。跟着做大约 40 分钟。
 
 目录：
 
 1. [准备工作](#1-准备工作)
-2. [改造仓库](#2-改造仓库)
-3. [配置变量与密钥](#3-配置变量与密钥)
-4. [第一次构建](#4-第一次构建)
-5. [局域网分发](#5-局域网分发)
-6. [客户端自动更新](#6-客户端自动更新)
-7. [服务端部署](#7-服务端部署)
-8. [日常维护](#8-日常维护)
-9. [故障排查](#9-故障排查)
+2. [切换分支](#2-切换分支)
+3. [注册 runner](#3-注册-runner)
+4. [配置变量与密钥](#4-配置变量与密钥)
+5. [第一次构建](#5-第一次构建)
+6. [局域网分发](#6-局域网分发)
+7. [日常维护](#7-日常维护)
+8. [故障排查](#8-故障排查)
 
 ---
 
 ## 1. 准备工作
 
-### 需要的账号和工具
+### 需要的机器
+
+| 角色 | 要求 | 装什么 |
+| --- | --- | --- |
+| Linux 机 | 常开，2 核 4G 起 | Docker、Git、Python 3 |
+| Windows 机（可选） | 要构建桌面端才需要 | Git、Node.js 24 |
+
+一台 Linux 机就够构建服务端和安卓。桌面端要 Windows 机器，没有就用 `main` 分支。
+
+### 需要的工具
 
 | 项目 | 说明 |
 | --- | --- |
-| GitHub 账号 | 免费账户就够 |
-| Git | 用于推送代码 |
-| GitHub CLI（可选但强烈推荐） | 命令行操作 Actions，比点网页快很多 |
+| GitHub 账号 | 免费账户够用 |
+| Git | 推代码 |
+| GitHub CLI | 强烈推荐，下面命令都用它 |
 
-安装 `gh` 并登录：
+安装并登录：
 
 ```bash
-# Windows
-winget install GitHub.cli
-# macOS
-brew install gh
-# Linux
-sudo apt install gh
-
-# 登录（浏览器授权）
 gh auth login
 ```
 
-确认登录成功：
+> 用 `gh` 而不是 curl + token。`gh` 会把凭证存进系统钥匙串，之后不用再传 token。
+
+---
+
+## 2. 切换分支
+
+本方案在 `self-hosted` 分支：
 
 ```bash
-gh auth status
+git clone https://github.com/<你>/vcp-cicd.git
+cd vcp-cicd
+git checkout self-hosted
 ```
 
-### 关于构建额度
+`self-hosted` 分支的 workflow 用 `self-hosted` 标签，任务会派给**你自己的机器**。
 
-| 仓库类型 | 额度 |
+---
+
+## 3. 注册 runner
+
+### Linux
+
+在 GitHub 网页上操作：
+
+1. 进入仓库 → **Settings** → **Actions** → **Runners**
+2. 点 **New self-hosted runner** → 选 **Linux**
+3. 页面上会给出下载和解压命令，照做
+
+然后配置并安装为**用户级**服务：
+
+```bash
+# 换成页面给你的 token
+./config.sh \
+  --url https://github.com/<你>/vcp-cicd \
+  --token <REGISTRATION_TOKEN> \
+  --name <机器名> \
+  --labels self-hosted,linux \
+  --work _work
+
+# 装成 systemd 用户服务，不用 root
+./svc.sh install
+./svc.sh start
+```
+
+让服务在未登录时也保持运行：
+
+```bash
+loginctl enable-linger $USER
+```
+
+> `config.sh --token` 那个 token 只用于注册，一小时后失效，不用保存。
+
+要跑 Android 构建的话，把 runner 用户加进 docker 组：
+
+```bash
+sudo usermod -aG docker <你的用户>
+```
+
+改完要重新登录才生效。
+
+### Windows
+
+1. 仓库 → **Settings** → **Actions** → **Runners** → **New self-hosted runner** → **Windows**
+2. 下载解压，用 PowerShell 执行：
+
+```powershell
+.\config.cmd --url https://github.com/<你>/vcp-cicd `
+  --token <REGISTRATION_TOKEN> `
+  --name <机器名> `
+  --labels self-hosted,windows,local `
+  --work _work
+```
+
+3. 别装成 Windows 服务，改成计划任务，绑当前用户：
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "C:\actions-runner\run.cmd" -WorkingDirectory "C:\actions-runner"
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+Register-ScheduledTask -TaskName "GitHub Actions Runner" -Action $action -Trigger $trigger
+```
+
+> **为什么不用 Windows 服务**：`desktop` job 会用 `local` 标签，只有本机在线才构建。
+> 装成服务会以 SYSTEM 身份跑，跟桌面环境隔开，构建 Electron 容易出权限问题。
+
+---
+
+## 4. 配置变量与密钥
+
+### 仓库变量
+
+不进密钥、可以公开的值：
+
+```bash
+gh variable set VCP_SERVER_URL --repo <你>/vcp-cicd --body "http://<内网地址>:6005"
+gh variable set VCP_APK_URL    --repo <你>/vcp-cicd --body "http://<内网地址>:8090/"
+```
+
+| 变量 | 用途 |
 | --- | --- |
-| 公开仓库 | Actions 不限时长，免费 |
-| 私有仓库 | 每月 2000 分钟，Windows 按 2 倍计费 |
+| `VCP_SERVER_URL` | 编进 App 的默认服务端地址 |
+| `VCP_APK_URL` | APK 分发地址，App 自动更新用 |
+| `VCP_CI_DIR` | 服务端部署目录（仅自托管需要） |
+| `VCP_MOBILE_DIR` | APK 分发目录（仅自托管需要） |
+| `VCP_CHAT_DIR` | 桌面端产物目录（仅自托管需要） |
+| `VCP_CHAT_SCRIPT` | 打包脚本路径 |
 
-三个项目的完整构建大约消耗：
-- 服务端：10～25 分钟（靠缓存，首次更久）
-- 移动端 APK：15～30 分钟（首次），之后命中缓存约 10 分钟
-- 桌面端：20～40 分钟（首次，要下载 Electron）
+### 签名密钥
 
-如果仓库设为公开，这些都不计费。**建议用公开仓库。**
-
----
-
-## 2. 改造仓库
-
-### 创建仓库
-
-```bash
-# 在 GitHub 上建一个空仓库，名字随意，这里用 vcp-build
-gh repo create vcp-build --public --description "VCP 三端自动构建"
-```
-
-### 准备 workflow
-
-仓库里必须有一个 `.github/workflows/` 目录（**注意 workflows 前面的点，少写会完全不生效**），放构建流水线。
-
-目录结构：
-
-```
-.github/workflows/vcp-build-release.yml     ← 核心流水线
-vcpmobile/build-apk.sh                      ← APK 构建脚本
-```
-
-推送：
-
-```bash
-git clone https://github.com/<你>/vcp-build.git
-cd vcp-build
-# 复制文件进去
-git add .
-git commit -m "init"
-git push
-```
-
-推送后打开 **Actions** 标签页，应该能看到 `VCP Build & Release`。
-
-> 看不到工作流？确认路径是 `.github/workflows/`，不是 `github/workflows/`。
-
----
-
-## 3. 配置变量与密钥
-
-进入 **Settings → Secrets and variables → Actions**。
-
-### Variables（仓库变量，不加密）
-
-这些不是秘密，只是配置项：
-
-| 变量名 | 必填 | 说明 | 示例 |
-| --- | --- | --- | --- |
-| `VCP_SERVER_URL` | 是 | 编进 App 的服务端地址 | `http://192.168.2.100:6005` |
-| `VCP_APK_URL` | 否 | 局域网下载页，仅用于提示 | `http://192.168.2.100:8090/` |
-
-用命令行设置：
-
-```bash
-gh variable set VCP_SERVER_URL --repo <你>/vcp-build --body "http://192.168.2.100:6005"
-gh variable set VCP_APK_URL    --repo <你>/vcp-build --body "http://192.168.2.100:8090/"
-```
-
-> `VCP_SERVER_URL` 会写进 APK 的 Rust 默认配置。用户装完 App 打开就能用，不用手动填地址。
-
-### Secrets（密钥，加密）
-
-只有 APK 签名需要。**不配也能构建**，但产出是未签名 APK，装不上。
-
-#### 生成签名密钥
+APK 必须签名才能覆盖升级。先生成一个：
 
 ```bash
 keytool -genkeypair -v \
   -keystore release.jks \
-  -alias vcp \
+  -alias vcpmobile \
   -keyalg RSA -keysize 2048 -validity 10000 \
-  -dname "CN=VCP, OU=Dev, O=Personal, L=Local, ST=Local, C=CN"
+  -storepass '<口令>' -keypass '<口令>' \
+  -dname "CN=VCPMobile, OU=Dev, O=<你的名字>, C=CN"
 ```
 
-会提示输入口令，记下来。
-
-> **极其重要**：这个 `.jks` 文件丢了，已装的 App 就永远无法覆盖升级，只能让用户卸载重装。
-> 生成后立刻备份到两个不同的地方（U 盘 + 网盘，或者密码管理器）。
-
-#### 转 Base64
+上传到 Secrets：
 
 ```bash
-# Linux / macOS
 base64 -w 0 release.jks > release.jks.b64
-
-# Windows PowerShell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("release.jks")) | Set-Content release.jks.b64 -NoNewline
-
-# Git Bash
-certutil -encode release.jks release.jks.b64   # 会带首尾标记，需要手动删掉
+gh secret set ANDROID_KEYSTORE_BASE64 --repo <你>/vcp-cicd < release.jks.b64
+gh secret set ANDROID_KEY_ALIAS       --repo <你>/vcp-cicd --body "vcpmobile"
+gh secret set ANDROID_KEYSTORE_PASSWORD --repo <你>/vcp-cicd --body "<口令>"
+gh secret set ANDROID_KEY_PASSWORD      --repo <你>/vcp-cicd --body "<口令>"
 ```
 
-#### 上传四个 Secret
+> **这个 keystore 和口令务必自己备份好。** 丢了就没法给已装的 App 做覆盖升级，用户只能卸载重装。
+> 绝对不要提交进仓库。
+
+### Docker Hub（可选）
+
+要自动推镜像的话：
 
 ```bash
-gh secret set ANDROID_KEYSTORE_BASE64 --repo <你>/vcp-build < release.jks.b64
-gh secret set ANDROID_KEY_ALIAS --repo <你>/vcp-build --body "vcp"
-gh secret set ANDROID_KEYSTORE_PASSWORD --repo <你>/vcp-build --body "你的口令"
-gh secret set ANDROID_KEY_PASSWORD --repo <你>/vcp-build --body "你的口令"
+gh secret set DOCKERHUB_USERNAME --repo <你>/vcp-cicd --body "<Hub 用户名>"
+gh secret set DOCKERHUB_TOKEN    --repo <你>/vcp-cicd --body "<Hub access token>"
 ```
 
-或者网页上逐个添加。确认：
-
-```bash
-gh secret list --repo <你>/vcp-build
-```
-
-#### 上传完删掉本地文件
-
-```bash
-shred -u release.jks release.jks.b64   # Linux
-# Windows
-Remove-Item release.jks,release.jks.b64
-```
-
-**但要先确保备份好了。**
+token 在 Docker Hub → Account Settings → Security → New Access Token 生成。
 
 ---
 
-## 4. 第一次构建
-
-### 手动触发
+## 5. 第一次构建
 
 ```bash
-gh workflow run vcp-build-release.yml --repo <你>/vcp-build
+gh workflow run vcp-build-release.yml --repo <你>/vcp-cicd
 ```
 
-指定只构建某一端：
+只构建某一个：
 
 ```bash
-gh workflow run vcp-build-release.yml --repo <你>/vcp-build -f targets=mobile
-gh workflow run vcp-build-release.yml --repo <你>/vcp-build -f targets=desktop
-gh workflow run vcp-build-release.yml --repo <你>/vcp-build -f targets=backend
+gh workflow run vcp-build-release.yml --repo <你>/vcp-cicd -f targets=mobile
 ```
 
-### 观察进度
+盯着进度：
 
 ```bash
-# 实时跟踪
-gh run watch --repo <你>/vcp-build
-
-# 看列表
-gh run list --repo <你>/vcp-build
-
-# 只看失败的日志
-gh run view --repo <你>/vcp-build --log-failed
+gh run list --repo <你>/vcp-cicd --limit 5
+gh run watch --repo <你>/vcp-cicd
 ```
 
-网页也可以：Actions → 点进运行 → 点开 job 看实时日志。
+构建失败看日志：
 
-### 拿到产物
+```bash
+gh run view --repo <你>/vcp-cicd --log-failed
+```
 
-构建成功后进入仓库 **Releases** 页面，最新一条里附带了所有文件：
+### 按需构建怎么工作
 
-| 文件 | 内容 |
+每次只编译上游真的变了的组件：
+
+```
+detect job 查三个上游的最新 commit
+      │
+      对比 state 分支上记录的 SHA
+      │
+      ├── 变了 → 构建
+      └── 没变 → 跳过
+```
+
+第一次运行没有记录，三个全构建。之后就是按需。
+
+想强制重建：
+
+```bash
+# 指定目标强制构建
+gh workflow run vcp-build-release.yml --repo <你>/vcp-cicd -f targets=backend
+
+# 或者指定具体提交
+gh workflow run vcp-build-release.yml --repo <你>/vcp-cicd -f sha=<commit>
+```
+
+---
+
+## 6. 局域网分发
+
+产物落在各 runner 的工作目录下：
+
+| 组件 | 位置 |
 | --- | --- |
-| `VCPMobile-latest.apk` | Android 安装包 |
-| `VCP聊天客户端 Setup x.y.z.exe` | Windows 安装包 |
-| `vcptoolbox-xxxxxxxx.tar.gz` | 服务端镜像（docker save 格式） |
-| `SHA256SUMS.txt` | 全部文件的校验和 |
-| `manifest.json` | APK 版本信息 |
+| APK | `$VCP_MOBILE_DIR/out/` |
+| 桌面端 | `$VCP_CHAT_DIR/out/` |
+| 服务端镜像 | Docker 里，tag 为 `<commit>` |
 
-命令行下载：
+### APK 分发
+
+用一个静态服务器把 `$VCP_MOBILE_DIR/out/` 暴露出来：
+
+```yaml
+# docker-compose.yml
+services:
+  apk:
+    image: nginx:alpine
+    ports:
+      - "8090:80"
+    volumes:
+      - /path/to/vcpmobile/out:/usr/share/nginx/html:ro
+```
+
+手机访问 `http://<内网地址>:8090/` 就能下载。App 里的自动更新地址指向同一个位置。
+
+### 服务端部署
+
+镜像构建完直接在本地：
 
 ```bash
-gh release download --repo <你>/vcp-build --dir ./dist
+docker compose up -d
 ```
+
+镜像 tag 用 commit 短 hash，回滚就是换回旧的 tag。
 
 ---
 
-## 5. 局域网分发
+## 7. 日常维护
 
-公网 Release 页面能下载，但局域网更快，而且离线也能用。
-
-### 方案：NAS 定时同步 + 静态服务
-
-#### 5.1 建目录
+### 检查 runner 状态
 
 ```bash
-# 举例，路径随你
-mkdir -p /srv/vcp/{apk,chat}
+# Linux
+systemctl --user status github-runner.service
+
+# 或者直接问 GitHub
+gh api repos/<你>/vcp-cicd/actions/runners --jq '.runners[] | "\(.name) \(.status)"'
 ```
 
-#### 5.2 同步脚本
-
-新建 `/srv/vcp/sync.sh`：
+### runner 掉线
 
 ```bash
-#!/usr/bin/env bash
-# 把最新 Release 产物同步到局域网目录
-set -euo pipefail
-
-REPO="<你>/vcp-build"
-APK_DIR=/srv/vcp/apk
-CHAT_DIR=/srv/vcp/chat
-
-# 拉取最新 Release 的 APK 和安装包
-gh release download --repo "$REPO" --pattern '*.apk' --dir "$APK_DIR" --clobber
-gh release download --repo "$REPO" --pattern 'manifest.json' --dir "$APK_DIR" --clobber
-gh release download --repo "$REPO" --pattern '*.exe' --dir "$CHAT_DIR" --clobber
-
-chmod -R a+rX "$APK_DIR" "$CHAT_DIR"
-echo "同步完成: $(date '+%F %T')"
+systemctl --user restart github-runner.service
 ```
 
-赋予执行权限并测试：
-
-```bash
-chmod +x /srv/vcp/sync.sh
-/srv/vcp/sync.sh
-ls -lh /srv/vcp/apk
-```
-
-> NAS 上需要先装 `gh` 并登录一次（`gh auth login`），用只读权限的 token 就够。
-
-#### 5.3 定时执行
-
-```bash
-# crontab -e，每 30 分钟同步一次
-*/30 * * * * /srv/vcp/sync.sh >> /var/log/vcp-sync.log 2>&1
-```
-
-或者用 systemd timer。
-
-#### 5.4 起一个静态服务
-
-nginx 配置示例：
-
-```nginx
-server {
-    listen 8090;
-    server_name _;
-    root /srv/vcp/apk;
-
-    charset utf-8;
-
-    # APK 不缓存，保证拿到最新版
-    location ~* \.apk$ {
-        add_header Cache-Control "no-store";
-        types { }
-        default_type application/vnd.android.package-archive;
-    }
-
-    # 版本清单也不缓存
-    location = /manifest.json {
-        add_header Cache-Control "no-store";
-        default_type application/json;
-    }
-
-    location /health {
-        return 200 "ok\n";
-        default_type text/plain;
-    }
-}
-```
-
-重载 nginx 后测试：
-
-```bash
-curl -I http://127.0.0.1:8090/VCPMobile-latest.apk
-curl http://127.0.0.1:8090/manifest.json
-```
-
-#### 5.5 手机访问
-
-手机连同一个 WiFi，浏览器打开：
-
-```
-http://<NAS的IP>:8090/
-```
-
-会看到下载页，点按钮直接装。
-
----
-
-## 6. 客户端自动更新
-
-### Android
-
-App 内置的更新检查会读取 `manifest.json`，比对 `versionCode`。只要有新版就提示。
-
-流程：
-
-1. 上游有新提交 → Actions 构建出新 APK
-2. Release 更新 → NAS 同步脚本拉到本地
-3. 用户打开 App → 读到新 `manifest.json` → 提示更新
-4. 点击下载 → 从局域网服务器拉 APK → 系统安装
-
-**前提**：新旧 APK 必须同一个签名。所以签名密钥配好后不要再换。
-
-### Windows
-
-VCPChat 是 Electron 应用，更新方式是下载新安装包覆盖安装。安装包通过同一个局域网服务分发。
-
----
-
-## 7. 服务端部署
-
-Release 里的 `vcptoolbox-xxxxxxxx.tar.gz` 是镜像归档。
-
-### 在 NAS 上导入并运行
-
-```bash
-# 下载
-gh release download --repo <你>/vcp-build --pattern 'vcptoolbox-*.tar.gz' --dir /tmp
-
-# 导入镜像
-gunzip -c /tmp/vcptoolbox-*.tar.gz | docker load
-
-# 看导入的镜像名
-docker images | grep vcptoolbox
-
-# 用 compose 起服务
-cd /path/to/compose
-docker compose -f docker-compose.prod.yml up -d
-```
-
-### 或者直接构建（不用 Actions 产物）
-
-如果服务端就在 NAS 上跑，本地构建更快：
-
-```bash
-git clone https://github.com/lioensky/VCPToolBox.git
-cd VCPToolBox
-docker build -t vcptoolbox:local .
-```
-
-健康检查：
-
-```bash
-curl -I http://127.0.0.1:6005/v1/models     # 401 表示服务正常，需要鉴权
-```
-
----
-
-## 8. 日常维护
+`gh` 里显示 `offline` 就是没连上。检查网络、Docker 权限、磁盘空间。
 
 ### 定时构建
 
-流水线默认每 6 小时检查一次上游。要改频率改 `vcp-build-release.yml` 里的 cron：
+workflow 里配了每 6 小时检查一次：
 
 ```yaml
-on:
-  schedule:
-    - cron: '0 */6 * * *'    # 每 6 小时（UTC）
+schedule:
+  - cron: '0 */6 * * *'
 ```
 
-常用值：
+> **GitHub 会在仓库 60 天没活动后自动停用定时任务**，到时候去 Actions 页面点一下 Enable。
+> 另外改 workflow 文件会重置定时注册，生效可能要等几个小时。别反复改。
 
-| cron | 含义 |
-| --- | --- |
-| `0 */6 * * *` | 每 6 小时 |
-| `0 0 * * *` | 每天零点 |
-| `0 2 * * 1` | 每周一凌晨 2 点 |
-| `*/30 * * * *` | 每 30 分钟 |
-
-> **改完 cron 之后别再反复改 workflow 文件**。GitHub 的定时注册是异步的，
-> 每次改文件都会把注册队列清零重来，可能几个小时才生效。
-> 期间要构建就手动 `gh workflow run`。
-
-### 防止定时任务被暂停
-
-公开仓库 60 天没有提交时，GitHub 会自动暂停定时工作流。
-
-恢复方法：Actions 页面点 **Enable**，或者随便提交一次。
-
-### 清理旧 Release
-
-Release 会越积越多。定期删掉旧的：
+### 清理旧产物
 
 ```bash
-# 列出所有 tag
-gh release list --repo <你>/vcp-build
-
-# 删除某个
-gh release delete <tag> --repo <你>/vcp-build --yes
-
-# 删除对应 tag
-git push --delete origin <tag>
-```
-
-### 轮换签名密钥（一般不需要）
-
-只有密钥泄露才需要。换密钥意味着所有用户必须卸载重装，慎用。
-
----
-
-## 9. 故障排查
-
-### workflow 不出现 / 无法触发
-
-**症状**：`gh workflow run` 报 404 或 `Workflow does not have 'workflow_dispatch' trigger`。
-
-**原因**：文件不在 `.github/workflows/` 下。写成了 `github/workflows/`（少了点）。
-
-**处理**：
-
-```bash
-ls -la .github/workflows/
-gh api repos/<你>/vcp-build/actions/workflows --jq '.workflows[].path'
-```
-
-### 移动端：`未配置仓库变量 VCP_SERVER_URL`
-
-变量没建。见[第 3 节](#3-配置变量与密钥)。
-
-### 移动端：`Release signing is incomplete`
-
-四个 Secret 没配全，或者 `ANDROID_KEY_ALIAS` 和生成时用的 `-alias` 不一致。
-
-检查：
-
-```bash
-gh secret list --repo <你>/vcp-build
-```
-
-### 桌面端：`Could not find any Visual Studio installation`
-
-托管 Windows 镜像已经切换到 Visual Studio 2026，而依赖自带的 `node-gyp` 太旧，识别不了新版本号。
-
-流水线里已经用 `npm install -g node-gyp@latest` 处理了。如果上游改了依赖结构导致又失败，手动确认这一步还在。
-
-### 桌面端：`MSB8040 需要缓解了 Spectre 漏洞的库`
-
-`node-pty` 的 gyp 配置强制要求 Spectre 库。流水线会自动改两个 `*.gyp` 文件关掉这个检查。
-
-如果失败，检查上游是否重命名了这些文件：
-
-```
-node_modules/node-pty/binding.gyp
-node_modules/node-pty/deps/winpty/src/winpty.gyp
-```
-
-### 桌面端：`Runtime closure policy failed`
-
-`npm ci --omit=optional` 跳过了 `sharp` 的平台二进制，打包时的完整性校验失败。
-
-流水线已自动补装 `@img/sharp-win32-x64`。
-
-### APK 装不上 / 提示"应用未安装"
-
-**签名不一致**。已装的旧版是别的证书签的。
-
-处理：卸载旧版再装。之后只要不换密钥就不会再发生。
-
-查看当前 APK 的签名：
-
-```bash
-apksigner verify --print-certs VCPMobile-latest.apk
-```
-
-### 构建很慢
-
-首次构建最慢，需要下载 Rust crates、Gradle 发行包、Electron 二进制。之后会被缓存。
-
-想进一步加速：
-- 确认 Rust 缓存和 Gradle 缓存在工作流里没被跳过
-- 服务端如果不需要 Actions 构建，直接在 NAS 上 `docker build` 更快
-
-### 额度不够用
-
-把仓库改成公开，Actions 完全免费。
-
-```bash
-gh repo edit <你>/vcp-build --visibility public
+# 删掉 7 天前的 artifact
+gh api repos/<你>/vcp-cicd/actions/artifacts --jq '.artifacts[] | select(.created_at < "日期") | .id' |
+  xargs -I{} gh api -X DELETE repos/<你>/vcp-cicd/actions/artifacts/{}
 ```
 
 ---
 
-## 附：本地编译（备用）
+## 8. 故障排查
 
-GitHub Actions 不可用时，可以退回本地编译。完整的自托管方案在 `self-hosted` 分支。
+### runner 注册失败
 
-简要步骤：
-
-```bash
-# APK（需要 Docker 或完整 Android 工具链）
-WORK=/path/to/work BUILD_MODE=host \
-VCP_SERVER_URL=http://192.168.2.100:6005 \
-KEY_ALIAS=vcp KEY_PASS=口令 KEYSTORE_PATH=/path/release.jks \
-bash vcpmobile/build-apk.sh
+```
+Cannot configure the runner because it is already configured
 ```
 
-Windows 客户端：
+之前注册过。删掉配置重新来：
+
+```bash
+rm -f .runner .credentials .credentials_rsaparams
+./config.sh --url ... --token ... --replace
+```
+
+### Linux 上操作用户服务报 `Failed to connect to bus`
+
+```bash
+systemctl --user status ...
+# Failed to connect to bus: No medium found
+```
+
+`su` 切过去时没有用户会话。加环境变量：
+
+```bash
+XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user status ...
+```
+
+### job 一直挂着不跑
+
+看 runner 标签是否匹配：
+
+```bash
+gh api repos/<你>/vcp-cicd/actions/runners --jq '.runners[] | "\(.name): \(.labels[].name)"'
+```
+
+workflow 里 `runs-on: self-hosted, linux`，runner 必须同时有这两个标签。
+
+`desktop` job 带 `local` 标签，Windows 机不在线就一直排队，这是设计如此。
+
+### Linux 上 Docker 报权限错误
+
+```
+permission denied while trying to connect to the Docker daemon socket
+```
+
+runner 用户没在 docker 组：
+
+```bash
+sudo usermod -aG docker <用户>
+# 重新登录
+```
+
+### Android 构建报 Maven 403
+
+直连 Maven Central 被拒。加镜像：
+
+```bash
+mkdir -p ~/.gradle/init.d
+cat > ~/.gradle/init.d/init-mirror.gradle <<'EOF'
+allprojects {
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        google()
+        mavenCentral()
+    }
+}
+EOF
+```
+
+### APK 报 `Release signing is incomplete`
+
+Gradle 读不到签名环境变量。宿主模式下必须 export：
+
+```bash
+export ANDROID_KEYSTORE_PATH=/绝对路径/release.jks
+export ANDROID_KEY_ALIAS=vcpmobile
+export ANDROID_KEYSTORE_PASSWORD=<口令>
+export ANDROID_KEY_PASSWORD=<口令>
+```
+
+注意这个错是在 Rust 编译**之后**才报的，前面全绿别以为没事。
+
+### Electron 构建报 node-pty MSB8040
+
+VS 缺 Spectre 库。改 gyp 绕过：
 
 ```powershell
-$env:VCP_CHAT_DIR = "D:\vcpchat"
-.\vcpchat\build-chat.ps1
+(Get-Content node_modules/node-pty/binding.gyp -Raw) -replace "Spectre", "false" | Set-Content node_modules/node-pty/binding.gyp
 ```
+
+`deps/winpty/src/winpty.gyp` 也要改。
+
+### 打包报 `Runtime closure policy failed`
+
+`sharp` 的原生二进制没装：
+
+```powershell
+npm install --no-save @img/sharp-win32-x64
+```
+
+---
+
+<p align="center">
+  <sub>上游：<a href="https://github.com/lioensky/VCPToolBox">VCPToolBox</a> · <a href="https://github.com/MRiecy/VCPMobile">VCPMobile</a> · <a href="https://github.com/lioensky/VCPChat">VCPChat</a></sub>
+</p>
