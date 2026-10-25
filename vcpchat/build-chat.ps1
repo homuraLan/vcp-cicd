@@ -1,0 +1,151 @@
+# VCPChat Windows 构建脚本
+#
+# 在 Windows 本机（self-hosted runner）执行。
+# Electron 打包必须在目标平台上进行：electron-builder 会下载 win32 Electron 二进制，
+# 并针对当前平台重建 better-sqlite3 / node-pty / sharp 等原生模块，跨平台交叉打包不可靠。
+
+param(
+    [string]$Sha = "",
+    [string]$Work = "",
+    [switch]$Force
+)
+
+$ErrorActionPreference = "Stop"
+
+# 工作目录：优先用参数，其次环境变量 VCP_CHAT_DIR
+if (-not $Work) { $Work = $env:VCP_CHAT_DIR }
+if (-not $Work) { throw "请通过 -Work 参数或 VCP_CHAT_DIR 环境变量指定工作目录" }
+
+$Src       = Join-Path $Work "src"
+$Out       = Join-Path $Work "out"
+$StateFile = Join-Path $Work "state.json"
+$LogDir    = Join-Path $Work "logs"
+$Upstream  = "https://github.com/lioensky/VCPChat.git"
+
+New-Item -ItemType Directory -Force -Path $Work, $Out, $LogDir | Out-Null
+
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$Log   = Join-Path $LogDir "build-$Stamp.log"
+
+function Log($msg) {
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg"
+    Write-Host $line
+    Add-Content -Path $Log -Value $line -Encoding UTF8
+}
+
+# ---- 确定目标版本 ----
+if ($Sha) {
+    $Target = $Sha
+} else {
+    $Target = (& git ls-remote $Upstream refs/heads/main | ForEach-Object { ($_ -split "`t")[0] })
+}
+if (-not $Target) { throw "无法获取上游 SHA" }
+$Short = $Target.Substring(0, 8)
+
+Log "=== VCPChat 构建开始 $Short"
+
+# ---- 比对当前版本 ----
+$Current = ""
+if (Test-Path $StateFile) {
+    try { $Current = (Get-Content $StateFile -Raw | ConvertFrom-Json).sha } catch {}
+}
+if ($Current -eq $Target -and -not $Force) {
+    Log "已是最新版本 $Short，跳过构建"
+    exit 0
+}
+Log "当前: $(if($Current){$Current.Substring(0,8)}else{'<无>'}) -> 目标: $Short"
+
+# ---- 准备源码 ----
+if (-not (Test-Path (Join-Path $Src ".git"))) {
+    Log "首次克隆上游仓库（约 585MB，请耐心等待）"
+    if (Test-Path $Src) { Remove-Item -Recurse -Force $Src }
+    & git clone --filter=blob:none $Upstream $Src
+    if ($LASTEXITCODE -ne 0) { throw "克隆失败" }
+}
+
+Push-Location $Src
+try {
+    Log "拉取目标提交"
+    & git fetch --depth 1 origin $Target
+    & git checkout -f $Target
+    if ($LASTEXITCODE -ne 0) { throw "检出 $Target 失败" }
+
+    # ---- 安装依赖 ----
+    Log "安装依赖（含原生模块编译，耗时较长）"
+    & npm ci --omit=optional 2>&1 | Tee-Object -FilePath $Log -Append
+    if ($LASTEXITCODE -ne 0) {
+        Log "npm ci 失败，回退到 npm install"
+        & npm install 2>&1 | Tee-Object -FilePath $Log -Append
+    }
+
+    # ---- 修正 node-pty 的 Spectre 要求 ----
+    # node-pty 及其内嵌 winpty 的 gyp 都强制 'SpectreMitigation': 'Spectre'，
+    # 需要 VS 的 Spectre 缓解库（Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre）。
+    # 该组件未安装时 electron-builder 的 rebuild 会以 MSB8040 失败。
+    # 这里改为 'false' 跳过检查——只影响编译选项，不改任何业务代码；
+    # 每次安装依赖后都重新应用，保证幂等。
+    $gypFiles = @(
+        (Join-Path $Src "node_modules\node-pty\binding.gyp"),
+        (Join-Path $Src "node_modules\node-pty\deps\winpty\src\winpty.gyp")
+    )
+    foreach ($gypPath in $gypFiles) {
+        if (-not (Test-Path $gypPath)) { continue }
+        $gypText = Get-Content $gypPath -Raw
+        if ($gypText -match "'SpectreMitigation':\s*'Spectre'") {
+            $gypText = $gypText -replace "'SpectreMitigation':\s*'Spectre'", "'SpectreMitigation': 'false'"
+            [System.IO.File]::WriteAllText($gypPath, $gypText, (New-Object System.Text.UTF8Encoding($false)))
+            Log "已关闭 Spectre 检查: $(Split-Path $gypPath -Leaf)"
+        }
+    }
+
+    # ---- 补装 sharp 的平台二进制 ----
+    # npm ci --omit=optional 会跳过 sharp 的 @img/sharp-win32-x64 平台包，
+    # 而 package.json 的 electron-builder hooks（afterPack）会做 runtime closure 校验，
+    # 缺二进制时以 "native binary missing" 失败。这里显式补上。
+    if (Test-Path (Join-Path $Src "node_modules\sharp")) {
+        $imgWin = Join-Path $Src "node_modules\@img\sharp-win32-x64"
+        if (-not (Test-Path $imgWin)) {
+            Log "补装 sharp 的 win32-x64 二进制"
+            & npm install --no-save @img/sharp-win32-x64 2>&1 | Tee-Object -FilePath $Log -Append
+        }
+    }
+
+    # ---- 构建 Rust 运行时 ----
+    Log "构建 Rust 运行时组件"
+    & npm run build 2>&1 | Tee-Object -FilePath $Log -Append
+    if ($LASTEXITCODE -ne 0) { throw "Rust 运行时构建失败" }
+
+    # ---- 打包 Electron ----
+    Log "electron-builder 打包"
+    & npm run dist 2>&1 | Tee-Object -FilePath $Log -Append
+    if ($LASTEXITCODE -ne 0) { throw "electron-builder 打包失败" }
+
+    # ---- 收集产物 ----
+    $distDir = Join-Path $Src "dist"
+    if (-not (Test-Path $distDir)) { throw "未找到 dist 目录" }
+
+    $artifacts = Get-ChildItem $distDir -Include *.exe,*.msi,*.7z,*.zip -Recurse -File |
+                 Where-Object { $_.Length -gt 1MB }
+    if (-not $artifacts) { throw "dist 目录下没有找到安装包产物" }
+
+    Log "收集到 $($artifacts.Count) 个产物"
+    foreach ($a in $artifacts) {
+        Copy-Item $a.FullName -Destination $Out -Force
+        Log "  $($a.Name) ($([math]::Round($a.Length/1MB,1)) MB)"
+    }
+
+} finally {
+    Pop-Location
+}
+
+# ---- 写状态 ----
+$pkg = Get-Content (Join-Path $Src "package.json") -Raw | ConvertFrom-Json
+$state = [ordered]@{
+    sha        = $Target
+    version    = $pkg.version
+    built_at   = (Get-Date).ToString("o")
+    artifacts  = (Get-ChildItem $Out -File | Select-Object -ExpandProperty Name)
+}
+$state | ConvertTo-Json -Depth 5 | Set-Content $StateFile -Encoding UTF8
+
+Log "=== VCPChat 构建完成 $Short"

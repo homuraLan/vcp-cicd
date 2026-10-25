@@ -1,0 +1,30 @@
+// 国内 Maven 镜像（阿里云）—— 解决 repo.maven.apache.org 返回 403 / 访问慢
+// 通过 Gradle init script 注入，不改动上游源码。
+def MIRRORS = [
+    'https://maven.aliyun.com/repository/google',
+    'https://maven.aliyun.com/repository/public',
+    'https://maven.aliyun.com/repository/gradle-plugin',
+    'https://maven.aliyun.com/repository/central',
+]
+
+def addMirrors = { RepositoryHandler repos ->
+    MIRRORS.each { u ->
+        repos.maven {
+            url u
+            allowInsecureProtocol = true
+        }
+    }
+}
+
+allprojects {
+    buildscript {
+        addMirrors(repositories)
+    }
+    addMirrors(repositories)
+}
+
+settingsEvaluated { settings ->
+    settings.pluginManagement {
+        addMirrors(repositories)
+    }
+}

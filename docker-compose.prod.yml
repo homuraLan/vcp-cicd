@@ -1,0 +1,21 @@
+# 生产运行配置（CI/CD 会自动写入 docker-compose.override.yml 指定镜像）
+# 基础 compose 来自源码仓库，这里只做运行期覆盖
+services:
+  app:
+    container_name: vcptoolbox
+    ports:
+      - "6005:6005"
+      - "6006:6006"
+    environment:
+      TZ: Asia/Shanghai
+      UV_THREADPOOL_SIZE: "64"
+      VCP_MAIN_MAX_MEMORY: "4096M"
+    mem_limit: 6g
+    memswap_limit: 6g
+    volumes:
+      - .:/usr/src/app
+      - vcp_vectorstore:/usr/src/app/VectorStore
+      - /usr/src/app/pydeps
+      - /usr/src/app/node_modules
+      # 容器内 new-api 与 172.17.0.1:9000 通信；此处仅作说明
+    restart: unless-stopped

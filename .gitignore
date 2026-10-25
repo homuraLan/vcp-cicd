@@ -1,0 +1,35 @@
+# 依赖与缓存
+node_modules/
+.npm-cache/
+refs/.npm-cache/
+
+# 本地环境实参
+LOCAL-NOTES.md
+local/
+*.local.md
+
+# 构建产物
+android/build/
+*.apk
+out/
+dist/
+
+# 日志
+logs/
+*.log
+
+# 密钥（绝不入库）
+keys/
+*.jks
+*.keystore
+.secrets.env
+.newapi.env
+.webhook.env
+.webhook-secret
+*.token
+.ghtok
+
+# 临时
+tmp/
+.DS_Store
+Thumbs.db

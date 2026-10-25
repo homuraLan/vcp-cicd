@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VCPMobile 下载</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px 16px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #0f1115; color: #e6e8ec;
+      display: flex; flex-direction: column; align-items: center;
+      min-height: 100vh;
+    }
+    .card {
+      width: 100%; max-width: 420px;
+      background: #171a21; border: 1px solid #262b36;
+      border-radius: 16px; padding: 24px;
+    }
+    h1 { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+    .sub { color: #8b93a7; font-size: 13px; margin-bottom: 20px; }
+    .ver {
+      display: flex; align-items: baseline; gap: 8px;
+      margin-bottom: 16px; padding-bottom: 16px;
+      border-bottom: 1px solid #262b36;
+    }
+    .ver-num { font-size: 26px; font-weight: 600; color: #4ea1ff; }
+    .ver-code { font-size: 12px; color: #8b93a7; }
+    .meta { font-size: 12px; color: #8b93a7; line-height: 1.8; margin-bottom: 20px; }
+    .meta code { color: #b8c0d4; background: #22262f; padding: 1px 5px; border-radius: 4px; }
+    .btn {
+      display: block; width: 100%; padding: 14px;
+      background: #2b6cff; color: #fff; text-align: center;
+      border-radius: 10px; text-decoration: none;
+      font-size: 16px; font-weight: 600;
+      transition: background .15s;
+    }
+    .btn:active { background: #1d5ae0; }
+    .btn.secondary {
+      background: transparent; border: 1px solid #2f3542;
+      color: #c6ccdb; margin-top: 10px; font-size: 14px; padding: 11px;
+    }
+    .tip { margin-top: 18px; font-size: 12px; color: #6f7789; line-height: 1.7; }
+    .err { color: #ff6b6b; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>VCPMobile</h1>
+    <div class="sub">局域网内最新构建</div>
+
+    <div class="ver">
+      <span class="ver-num" id="ver">—</span>
+      <span class="ver-code" id="code"></span>
+    </div>
+
+    <div class="meta" id="meta">加载中…</div>
+
+    <a class="btn" id="dl" href="VCPMobile-latest.apk" download>下载 APK</a>
+    <a class="btn secondary" href="manifest.json">查看版本清单</a>
+
+    <div class="tip">
+      安装前需在系统设置中允许「安装未知来源应用」。<br>
+      下次构建完成后，重新打开本页即可获取新版本。
+    </div>
+  </div>
+
+  <script>
+    fetch('manifest.json?t=' + Date.now())
+      .then(function (r) { return r.json(); })
+      .then(function (m) {
+        document.getElementById('ver').textContent = 'v' + m.version;
+        document.getElementById('code').textContent = 'build ' + m.versionCode;
+
+        var sizeMb = m.size ? (m.size / 1048576).toFixed(1) + ' MB' : '未知';
+        var when = m.built_at ? new Date(m.built_at).toLocaleString('zh-CN') : '未知';
+        document.getElementById('meta').innerHTML =
+          '大小 <code>' + sizeMb + '</code><br>' +
+          '构建 <code>' + when + '</code><br>' +
+          '提交 <code>' + String(m.sha || '').slice(0, 8) + '</code>';
+
+        var dl = document.getElementById('dl');
+        dl.href = (m.apk || 'VCPMobile-latest.apk') + '?v=' + m.versionCode;
+      })
+      .catch(function (e) {
+        document.getElementById('meta').innerHTML =
+          '<span class="err">读取版本信息失败，可直接点击下方按钮下载</span>';
+      });
+  </script>
+</body>
+</html>
