@@ -79,49 +79,100 @@ rollback() {
 # 宿主机源码整目录挂载进容器，会覆盖镜像里的代码，所以必须同步更新
 if [ -d .git ]; then
   log "更新源码"
-  git fetch -q --depth 1 origin 2>/dev/null || true
 
-  # 本地改动先存起来，避免 pull 冲突。运行时产生的文件（Plugin 下的配置等）不该丢
+  BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
+  [ "$BRANCH" = "HEAD" ] && BRANCH=main
+
+  # 上游会 force push 改写历史，--ff-only 必然失败，所以直接对齐远端。
+  # 浅克隆下要 --unshallow 才能拿到完整对象，否则 reset 会缺 blob。
+  if ! git fetch --depth 1 origin "$BRANCH" 2>&1 | tail -3; then
+    log "拉取失败，保留当前源码"
+    exit 1
+  fi
+
+  # reset 会覆盖本地对跟踪文件的修改。先留一份，出问题能找回来
   if ! git diff --quiet 2>/dev/null; then
-    log "存在本地改动，暂存处理"
-    git stash push -q -m "auto-deploy-$(date +%s)" -- \
-      ':(exclude)docker-compose.override.yml' 2>/dev/null || true
+    CHANGED=$(git diff --name-only 2>/dev/null | tr '\n' ' ')
+    log "本地修改过的跟踪文件: $CHANGED"
+    mkdir -p .deploy-backup
+    for f in $CHANGED; do
+      [ -f "$f" ] && cp "$f" ".deploy-backup/$(echo "$f" | tr '/' '_').$(date +%s)" 2>/dev/null || true
+    done
+    log "已备份到 .deploy-backup"
   fi
 
-  if ! git pull --ff-only -q origin 2>/dev/null; then
-    log "快进失败，改用重置到远端最新"
-    git reset --hard origin/HEAD >/dev/null 2>&1 || rollback
+  if ! git reset --hard "origin/$BRANCH" >/dev/null 2>&1; then
+    log "重置失败（可能是浅克隆缺对象），尝试补全后重试"
+    git fetch --unshallow origin "$BRANCH" >/dev/null 2>&1 || true
+    if ! git reset --hard "origin/$BRANCH" >/dev/null 2>&1; then
+      rollback
+    fi
   fi
-  log "源码已更新到 $(git rev-parse --short HEAD)"
+
+  log "源码已更新到 $(git rev-parse --short HEAD)（$(git log -1 --format=%s | cut -c1-50)）"
+
+  # rust-vexus-lite 的原生模块跟 Node 版本强绑定，必须用镜像里编好的那份。
+  # 宿主目录里的预编译产物会遮住镜像的（见下面 volumes 说明），所以清掉。
+  if [ -d rust-vexus-lite ]; then
+    NODES=$(ls rust-vexus-lite/*.node 2>/dev/null | wc -l)
+    if [ "$NODES" -gt 0 ]; then
+      mkdir -p .node-backup
+      cp -a rust-vexus-lite/*.node .node-backup/ 2>/dev/null || true
+      rm -f rust-vexus-lite/*.node
+      log "已清理 $NODES 个宿主原生模块，改用镜像内的版本"
+    fi
+  fi
 fi
 
 # ---- 5. 切换镜像并重建 ----
-log "写入镜像配置"
+# 上游的 docker-compose.yml 是给本地开发用的，有三个挂载会毁掉镜像里的产物：
+#   .:/usr/src/app             宿主源码覆盖镜像代码
+#   /usr/src/app/pydeps        匿名卷遮住镜像里装好的 python 依赖
+#   /usr/src/app/node_modules  匿名卷遮住镜像里的 node_modules
+# 所以这里用 !override 整段替换挂载，只留配置和数据。
+log "写入部署配置"
 cat > docker-compose.override.yml <<EOF
 services:
   app:
     image: ${TARGET_IMAGE}
+    volumes: !override
+      - ./config.env:/usr/src/app/config.env
+      - ./TVStxt:/usr/src/app/TVStxt
+      - ./ToolConfigs:/usr/src/app/ToolConfigs
+      - ./Plugin/UserAuth:/usr/src/app/Plugin/UserAuth
+      - vcp_vectorstore:/usr/src/app/VectorStore
+      - ./dailynote:/usr/src/app/dailynote
+      - ./Plugin/VCPLog/log:/usr/src/app/Plugin/VCPLog/log
 EOF
 
 log "重启服务"
-if ! docker compose up -d --remove-orphans; then
+if ! docker compose up -d --force-recreate --remove-orphans; then
   rollback
 fi
 
 # ---- 6. 健康检查 ----
+# 6005 是主服务，对裸 GET 不回状态码；6006 会返回 302，更适合探活。
+# 任何一个端口有响应就算起来了。
 if [ -n "$HEALTH_URL" ]; then
-  log "等待服务就绪"
+  # 主服务对裸 GET 可能不回状态码，所以额外探测 6006
+  HOSTPORT=$(echo "$HEALTH_URL" | sed -E 's#^https?://([^/]+).*#\1#')
+  HOST=$(echo "$HOSTPORT" | sed -E 's#:[0-9]+$##')
+  ALT_URL="http://${HOST}:6006/"
+
+  log "等待服务就绪（$HEALTH_URL）"
   ok=false
-  for i in $(seq 1 30); do
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL" 2>/dev/null || echo 000)
-    # 401/302 也算活着的证据：服务在响应，只是需要认证
-    case "$code" in
-      200|301|302|307|401|403) ok=true; break ;;
-    esac
+  code=""
+  for i in $(seq 1 40); do
+    for u in "$HEALTH_URL" "$ALT_URL"; do
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$u" 2>/dev/null)
+      case "$code" in
+        200|301|302|307|401|403) ok=true; break 2 ;;
+      esac
+    done
     sleep 3
   done
   if [ "$ok" != "true" ]; then
-    log "健康检查未通过（最后状态码 $code）"
+    log "健康检查未通过（最后状态码 ${code:-无响应}）"
     rollback
   fi
   log "健康检查通过（$code）"

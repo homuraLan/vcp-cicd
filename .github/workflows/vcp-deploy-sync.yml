@@ -132,15 +132,20 @@ jobs:
           path: ci
 
       - name: 更新客户端
-        shell: pwsh
+        # 服务账户（NETWORK SERVICE）的 PATH 里没有 pwsh，只能用系统自带的 5.1
+        shell: powershell
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHAT_DIR: ${{ vars.VCP_CHAT_DIR }}
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
-          if (-not "${{ vars.VCP_CHAT_DIR }}") {
+          if (-not $env:CHAT_DIR) {
             Write-Host "未配置仓库变量 VCP_CHAT_DIR，跳过"
             exit 0
           }
-          ./ci/deploy/update-chat.ps1 `
-            -Tag "${{ needs.check.outputs.tag }}" `
-            -DeployDir "${{ vars.VCP_CHAT_DIR }}" `
-            -Repo "${{ github.repository }}"
+          if (-not $env:TAG) {
+            Write-Host "没有可用的发布标签，跳过"
+            exit 0
+          }
+          & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo "${{ github.repository }}"
+          exit $LASTEXITCODE
