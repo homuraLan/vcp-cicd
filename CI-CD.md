@@ -53,8 +53,7 @@ runner 空闲时 CPU 为 0%，构建只在 SHA 真的变化时发生一次。
 | Runner 1 | `linux` 型 — 标签 `self-hosted, linux` |
 | Runner 2 | `windows` 型 — 标签 `self-hosted, local, windows` |
 | Runner 目录 | 由各机器自行决定，不写死在 workflow 里 |
-| 服务名 | `actions.runner.<owner>-<repo>.<runner>.service` |
-| 执行用户 | root（需 `RUNNER_ALLOW_RUNASROOT=1`） |
+| Runner 模式 | 用户态运行（非 root、非系统服务） |
 
 ### 三个 job 如何分派
 
@@ -62,30 +61,84 @@ runner 空闲时 CPU 为 0%，构建只在 SHA 真的变化时发生一次。
 | --- | --- | --- |
 | `backend` | `self-hosted, linux` | VCPToolBox Docker 镜像与部署 |
 | `mobile` | `self-hosted, linux` | VCPMobile APK 交叉编译 |
-| `desktop` | `self-hosted, local, Windows` | VCPChat Electron 安装包 |
+| `desktop` | `self-hosted, local, windows` | VCPChat Electron 安装包 |
 
 `desktop` 只带 `local` 标签，所以本机不在线时它只会排队，不会误派到 NAS —— 这就是「本机上线才更新本机软件」的实现。
+
+### runner 的用户态运行
+
+runner 以**普通用户**身份运行，不注册为系统服务，不需要 root。
+
+Linux 上用 systemd 用户实例：
+
+```bash
+# 注册（普通用户身份）
+./config.sh --url https://github.com/<owner>/<repo> --token <TOKEN> \
+  --name <runner-name> --labels self-hosted,linux --unattended
+
+# 用户服务：~/.config/systemd/user/github-runner.service
+systemctl --user enable --now github-runner.service
+systemctl --user status github-runner.service
+
+# 允许未登录时也保持运行
+loginctl enable-linger <user>
+```
+
+Windows 上用计划任务（`AtLogOn`）达到同样效果：在登录会话里跑，不碰系统服务。
+
+> **用户级 runner**（一个 runner 服务该用户名下所有仓库）需要 GitHub 付费计划，
+> Free 账户只支持仓库级 / 组织级 runner。这里用的是**仓库级 + 用户态运行**，两者不是一回事。
 
 ### runner 常用操作
 
 ```bash
-systemctl status actions.runner.<owner>-<repo>.<runner>.service
-journalctl -u actions.runner.<owner>-<repo>.<runner>.service -f   # 看接单与执行
-systemctl restart actions.runner.<owner>-<repo>.<runner>.service
+# Linux（用户态）
+systemctl --user status github-runner.service
+journalctl --user -u github-runner.service -f     # 看接单与执行
+systemctl --user restart github-runner.service
+```
+
+```powershell
+# Windows
+Get-ScheduledTask -TaskName "VCP Actions Runner" | Select-Object State
+Start-ScheduledTask -TaskName "VCP Actions Runner"
 ```
 
 ### 手动触发一次部署
 
+用 [GitHub CLI](https://cli.github.com/)（`gh`）：
+
 ```bash
-curl -X POST -H "Authorization: Bearer <PAT>" \
-  -H "Accept: application/vnd.github+json" \
-  https://api.github.com/repos/<owner>/vcp-cicd/actions/workflows/vcp-deploy.yml/dispatches \
-  -d '{"ref":"main","inputs":{"sha":"<可选SHA>","force":false,"targets":"all"}}'
+# 触发全量
+gh workflow run vcp-deploy.yml --repo <owner>/vcp-cicd
+
+# 只重建某一端
+gh workflow run vcp-deploy.yml --repo <owner>/vcp-cicd -f targets=mobile
+
+# 指定提交 / 强制重建
+gh workflow run vcp-deploy.yml --repo <owner>/vcp-cicd -f sha=<SHA> -f force=true
 ```
 
-`targets` 可选 `all` / `backend` / `mobile` / `desktop`，用来只重建某一端。
+`targets` 可选 `all` / `backend` / `mobile` / `desktop`。
 
-或在网页 Actions → VCP Build & Deploy → Run workflow。
+查看进度与日志：
+
+```bash
+gh run list --repo <owner>/vcp-cicd                     # 最近几次运行
+gh run watch --repo <owner>/vcp-cicd                    # 实时跟踪最新一次
+gh run view --repo <owner>/vcp-cicd --log-failed        # 只看失败步骤的日志
+```
+
+`gh` 首次使用需登录：`gh auth login`。
+
+### 仓库变量
+
+路径和地址通过仓库变量注入，workflow 里不写死：
+
+```bash
+gh variable list --repo <owner>/vcp-cicd
+gh variable set VCP_CI_DIR --repo <owner>/vcp-cicd --body "/path/to/ci"
+```
 
 ### 本机 runner（Windows）
 
