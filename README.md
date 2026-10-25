@@ -115,13 +115,16 @@ docker pull homuralan/vcptoolbox:latest
 ```
 每 6 小时检查一次
       │
-      ├── VCPToolBox 有新提交？ → 只构建服务端镜像
+      ├── VCPToolBox 有新提交？ → 只构建服务端（镜像 + Linux 二进制）
       ├── VCPMobile  有新提交？ → 只构建 APK
       └── VCPChat    有新提交？ → 只构建 Windows 客户端
 ```
 
 没变化就跳过，不浪费构建时间。上一次成功的提交记在 `state` 分支上，
 用 SHA 比对，不依赖版本号或 tag。
+
+所以某次 Release 里只有一两个文件是**正常现象** —— 说明其它组件这轮没变。
+每次运行的摘要里都会链接到最近一次发布，从那里下载没变的组件即可。
 
 ## 常见问题
 
@@ -150,6 +153,24 @@ docker pull homuralan/vcptoolbox:latest
 <summary><b>为什么这次 Release 只有安卓包</b></summary>
 
 因为这次只有 VCPMobile 上游更新了。按需构建，只编译有变化的组件。
+
+没变的组件直接从**最近一次发布**下载，每次运行的摘要里都有那个链接。
+
+</details>
+
+<details>
+<summary><b>Linux 二进制跑不起来 / 报 glibc 错误</b></summary>
+
+这个包按 Alpine（musl）构建，和上游 Dockerfile 保持一致。glibc 系统（Debian、Ubuntu、
+CentOS 等）上可能缺库或加载不了原生模块。
+
+在 glibc 系统上请用容器镜像：
+
+```bash
+docker pull homuralan/vcptoolbox:latest
+```
+
+也可以装 `gcompat` 后在 musl 环境里跑。
 
 </details>
 
