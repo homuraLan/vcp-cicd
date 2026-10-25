@@ -1019,6 +1019,19 @@ jobs:
           sparse-checkout: deploy
           path: ci
 
+      - name: 检查脚本编码
+        # PowerShell 5.1 按系统代码页（简体中文是 GBK）读脚本文件，
+        # 没有 BOM 的 UTF-8 会被读成乱码，连引号都会错位。
+        shell: powershell
+        run: |
+          $f = ".\ci\deploy\update-chat.ps1"
+          $b = [System.IO.File]::ReadAllBytes((Resolve-Path $f))
+          if ($b[0] -ne 0xEF -or $b[1] -ne 0xBB -or $b[2] -ne 0xBF) {
+            Write-Host "ERROR: $f must be UTF-8 with BOM"
+            exit 1
+          }
+          Write-Host "encoding ok"
+
       - name: 更新客户端
         # 服务账户（NETWORK SERVICE）的 PATH 里没有 pwsh，只能用系统自带的 5.1。
         # 注意：5.1 按系统代码页读脚本，这个 run 块里只能写英文 —— 中文会乱码

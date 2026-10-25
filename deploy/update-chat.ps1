@@ -1,4 +1,4 @@
-# VCPChat 桌面端自动更新
+﻿# VCPChat 桌面端自动更新
 #
 # 由 GitHub Actions 在构建完成后调用，也可以由 runner 定时轮询触发。
 #
@@ -47,11 +47,14 @@ Log "目标版本: $Tag"
 
 # ---- 2. 查询该发布下的安装包 ----
 Log "查询发布资产"
-$assets = & gh release view $Tag --repo $Repo --json assets --jq '.assets[].name' 2>$null
+$assets = & gh release view $Tag --repo $Repo --json assets --jq '.assets[].name' 2>&1
 if ($LASTEXITCODE -ne 0) {
-    Log "查询发布失败，保留当前版本"
+    # 把 gh 的真实输出打出来，别静默失败
+    Log "查询发布失败: $($assets -join ' ')"
     exit 1
 }
+# 混进来的告警行不算资产名
+$assets = @($assets | Where-Object { $_ -match '\S' -and $_ -notmatch '^(warning|gh:)' })
 
 # 优先安装版，没有就退回免安装版
 $setup = $assets | Where-Object { $_ -like "*Setup*.exe" } | Select-Object -First 1
