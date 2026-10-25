@@ -123,6 +123,12 @@ jobs:
       || inputs.targets == 'mobile'
 
     steps:
+      # 先检出本仓库，拿到构建脚本
+      - name: 检出构建脚本
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
       - name: 检出上游源码
         uses: actions/checkout@v4
         with:
@@ -238,7 +244,7 @@ jobs:
           KEY_PASS="$ANDROID_KEYSTORE_PASSWORD" \
           KEYSTORE_PATH="${KEYSTORE_PATH:-}" \
           DOWNLOAD_URL="${{ vars.VCP_APK_URL }}" \
-            bash vcpmobile/build-apk.sh
+            bash ci/vcpmobile/build-apk.sh
 
       - name: 校验产物
         run: |
