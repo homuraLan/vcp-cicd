@@ -300,17 +300,23 @@ jobs:
           IMAGE_TAG="${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox:${SHORT}"
           mkdir -p pkg
 
-          # 从构建好的镜像里取出应用目录，而不是发布整包镜像
+          # 从构建好的镜像里取出应用目录，而不是发布整包镜像。
+          # 用 docker cp 而不是 docker export + tar 过滤：后者对 ./ 前缀和
+          # 隐藏文件的匹配行为不可靠，实测会取不到东西。
           CID=$(docker create "vcptoolbox:build")
-          docker export "$CID" | tar -x -C pkg ./usr/src/app 2>/dev/null || true
-          docker rm "$CID" >/dev/null
-
-          if [ ! -d pkg/usr/src/app ]; then
-            echo "::error::未能从镜像中取出应用目录"
+          if ! docker cp "$CID:/usr/src/app" pkg/app; then
+            docker rm -f "$CID" >/dev/null 2>&1 || true
+            echo "::error::未能从镜像中取出 /usr/src/app"
             exit 1
           fi
-          mv pkg/usr/src/app pkg/app
-          rm -rf pkg/usr
+          docker rm -f "$CID" >/dev/null 2>&1 || true
+
+          if [ ! -f "pkg/app/main.js" ] && [ ! -f "pkg/app/server.js" ]; then
+            echo "::error::取出的目录不完整，缺少入口文件"
+            ls -la pkg/app | head -20
+            exit 1
+          fi
+          echo "应用目录体积: $(du -sh pkg/app | cut -f1)"
 
           # 构建信息，跟二进制放在一起
           NODE_V=$(docker run --rm --entrypoint node "vcptoolbox:build" -v 2>/dev/null | head -1)
@@ -735,6 +741,9 @@ jobs:
 
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      backend_changed: ${{ needs.detect.outputs.backend }}
+      desktop_changed: ${{ needs.detect.outputs.desktop }}
+      mobile_changed: ${{ needs.detect.outputs.mobile }}
 
     steps:
       - name: 生成版本标签
@@ -945,6 +954,70 @@ jobs:
 
   # ============ 5. 运行摘要 ============
   # 保证无论本次是「全跳过」还是「有产出」，运行结束后都有一份带链接的说明
+  # ============ 4. 自动部署 ============
+  # 构建完成后立即把新版本推到在跑的 runner 上。
+  # 两条触发路径：
+  #   1. 本次有新构建 → 立刻部署（下面的 job）
+  #   2. runner 上线后发现落后 → 由 deploy-sync.yml 定时对齐
+  # 两条都调同一批脚本，行为一致。
+  deploy-server:
+    name: 部署服务端
+    needs: [detect, release]
+    # 只有服务端真的重建了才推，没变就不重启线上服务
+    if: |
+      always()
+      && !cancelled()
+      && needs.release.result == 'success'
+      && needs.release.outputs.backend_changed == 'true'
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出部署脚本
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: deploy
+          path: ci
+
+      - name: 更新服务
+        shell: bash
+        env:
+          DEPLOY_DIR: ${{ vars.VCP_SERVER_DIR }}
+          TARGET_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox:${{ needs.detect.outputs.backend_sha }}
+          TARGET_SHA: ${{ needs.detect.outputs.backend_sha }}
+          HEALTH_URL: ${{ vars.VCP_SERVER_URL }}
+        run: |
+          chmod +x ci/deploy/update-server.sh
+          bash ci/deploy/update-server.sh
+
+  deploy-chat:
+    name: 部署桌面端
+    needs: [detect, release]
+    if: |
+      always()
+      && !cancelled()
+      && needs.release.result == 'success'
+      && needs.release.outputs.desktop_changed == 'true'
+    runs-on: [self-hosted, windows, local]
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出部署脚本
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: deploy
+          path: ci
+
+      - name: 更新客户端
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./ci/deploy/update-chat.ps1 `
+            -Tag "${{ needs.release.outputs.tag }}" `
+            -DeployDir "${{ vars.VCP_CHAT_DIR }}" `
+            -Repo "${{ github.repository }}"
+
   summary:
     name: 构建摘要
     needs: [detect, backend, mobile, desktop, release]
