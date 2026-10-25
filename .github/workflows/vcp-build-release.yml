@@ -318,21 +318,34 @@ jobs:
             src/rust_voice_input_engine -> target
             src/rust_projectforge_indexer -> target
 
-      - name: 安装依赖
+      - name: 升级 node-gyp
+        shell: pwsh
+        run: |
+          # 托管 windows 镜像已切换到 Visual Studio 2026，
+          # 依赖自带的 node-gyp 太旧，识别不出新版本号，会直接放弃。
+          npm install -g node-gyp@latest
+          node-gyp --version
+
+      - name: 安装依赖（允许原生模块编译失败）
         shell: pwsh
         working-directory: src
         run: |
-          npm ci --omit=optional
+          # 这一步只负责把源码下载下来。原生模块此时可能编译失败
+          # （Spectre 组件缺失 / VS 版本不识别），下面修正后会重新编译。
+          npm install --omit=optional --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw "依赖下载失败" }
+
+          # 单独跑一次安装脚本，失败不中断
+          npm rebuild --ignore-scripts=false 2>&1 | Select-Object -Last 5
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "npm ci 失败，回退到 npm install"
-            npm install
+            Write-Host "::warning::原生模块首次编译未通过，将在修正后重试"
           }
 
-      - name: 修正原生模块编译配置
+      - name: 修正原生模块编译环境
         shell: pwsh
         working-directory: src
         run: |
-          # node-pty 强制要求 Spectre 缓解库，托管 runner 上不一定装了 VS 组件，
+          # node-pty 强制要求 Spectre 缓解库，托管环境不一定装了该组件，
           # 直接在 gyp 里关掉，避免 MSB8040
           $gypFiles = @(
             "node_modules/node-pty/binding.gyp",
@@ -348,14 +361,21 @@ jobs:
             }
           }
 
-          # npm ci --omit=optional 会跳过 sharp 的平台二进制，
-          # 而打包阶段的 runtime closure 校验会因为缺二进制而失败
+          # 打包阶段的 runtime closure 校验要求 sharp 的平台二进制存在
           if (Test-Path "node_modules/sharp") {
             if (-not (Test-Path "node_modules/@img/sharp-win32-x64")) {
               Write-Host "补装 sharp 的 win32-x64 二进制"
               npm install --no-save @img/sharp-win32-x64
             }
           }
+
+      - name: 重新编译原生模块
+        shell: pwsh
+        working-directory: src
+        run: |
+          # 补丁和 node-gyp 升级都就位了，重跑一次让原生模块真正编译出来
+          npx @electron/rebuild -f -w better-sqlite3 -w node-pty -w hnswlib-node
+          if ($LASTEXITCODE -ne 0) { throw "原生模块重编译失败" }
 
       - name: 构建并打包
         shell: pwsh
