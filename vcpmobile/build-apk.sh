@@ -13,9 +13,10 @@
 
 set -euo pipefail
 
-WORK=${WORK:?请设置 WORK 环境变量指向构建工作目录}
+WORK=${WORK:?请设置 WORK 环境变量指向工作目录（存放产物与缓存）}
 BUILD_MODE=${BUILD_MODE:-docker}
-SRC=$WORK/src
+# 源码目录默认在工作目录下的 src/，也允许单独指定（例如 CI 里源码检出在别处）
+SRC=${SRC_DIR:-$WORK/src}
 OUT=$WORK/out
 LOG_DIR=$WORK/logs
 IMAGE=${IMAGE:-vcpmobile-android:latest}
