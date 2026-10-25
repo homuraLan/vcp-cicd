@@ -34,13 +34,19 @@
 
 | 文件 | 说明 |
 | :--- | :--- |
-| `VCPMobile-latest.apk` | 安卓安装包，传到手机点击安装 |
-| `VCP_Setup_*.exe` | Windows 安装包，双击运行 |
-| `SHA256SUMS.txt` | 校验清单，可选 |
+| `VCPMobile-v<版本>-<hash>.apk` | 安卓安装包，传到手机点击安装 |
+| `VCPMobile-latest.apk` | 同上，固定名，适合收藏下载链接 |
+| `VCPChat-Setup-<版本>-<hash>.exe` | Windows 安装包，双击运行 |
+| `VCPChat-Portable-<版本>-<hash>.zip` | Windows 免安装版，解压即用 |
+| `vcptoolbox-<日期>-<hash>.tar.gz` | 服务端镜像归档，离线部署用 |
+| `SHA256SUMS.txt` | 校验清单 |
+
+文件名里的 `<hash>` 是上游提交的短 SHA，能直接对上源码版本。
 
 > 也可以直接拉取服务端镜像：
 > ```bash
-> docker pull homuralan/vcptoolbox:latest
+> docker pull homuralan/vcptoolbox:latest      # 最新
+> docker pull homuralan/vcptoolbox:<hash>      # 固定到某个提交
 > ```
 
 ## 各端说明
@@ -74,6 +80,21 @@ docker pull homuralan/vcptoolbox:latest
 
 也可以在 Settings 里手动点检查更新。
 
+## 构建规则
+
+**只有上游真的更新了才会重新编译。** 三个上游各自独立判断：
+
+```
+每 6 小时检查一次
+      │
+      ├── VCPToolBox 有新提交？ → 只构建服务端镜像
+      ├── VCPMobile  有新提交？ → 只构建 APK
+      └── VCPChat    有新提交？ → 只构建 Windows 客户端
+```
+
+没变化就跳过，不浪费构建时间。上一次成功的提交记在 `state` 分支上，
+用 SHA 比对，不依赖版本号或 tag。
+
 ## 常见问题
 
 <details>
@@ -93,7 +114,14 @@ docker pull homuralan/vcptoolbox:latest
 <details>
 <summary><b>多久更新一次</b></summary>
 
-上游有新提交时自动构建，通常几小时内。Releases 里的版本按日期编号。
+上游有新提交时自动构建，检查间隔 6 小时。Releases 里的版本号带日期和运行号。
+
+</details>
+
+<details>
+<summary><b>为什么这次 Release 只有安卓包</b></summary>
+
+因为这次只有 VCPMobile 上游更新了。按需构建，只编译有变化的组件。
 
 </details>
 
