@@ -1038,8 +1038,17 @@ jobs:
             Write-Host "no release tag, skip"
             exit 0
           }
-          & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo $env:REPO
-          exit $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          try {
+            & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo $env:REPO
+            if (-not $?) { exit 1 }
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            exit 0
+          }
+          catch {
+            Write-Host "ERR: $_"
+            exit 1
+          }
 
   summary:
     name: 构建摘要

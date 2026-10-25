@@ -80,6 +80,14 @@ rollback() {
 if [ -d .git ]; then
   log "更新源码"
 
+  # 部署目录一般属于 root，而 runner 用别的账户跑，git 会因为
+  # 「dubious ownership」拒绝操作。这个目录是我们自己指定的，加白名单。
+  # 只在当前命令生效，不改 runner 的全局 git 配置。
+  git -c safe.directory="$PWD" status >/dev/null 2>&1 || true
+  export GIT_CONFIG_COUNT=1
+  export GIT_CONFIG_KEY_0=safe.directory
+  export GIT_CONFIG_VALUE_0="$PWD"
+
   BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
   [ "$BRANCH" = "HEAD" ] && BRANCH=main
 
