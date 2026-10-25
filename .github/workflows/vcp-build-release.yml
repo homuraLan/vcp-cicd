@@ -822,12 +822,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 这次没重建的组件，指向最近一次发布，避免用户以为「没有」
+          # 状态要能直接看出成功还是失败，跳过的要说明去向
           state() {
             case "$1" in
-              success) echo "本次构建" ;;
-              skipped) echo "[未变更](${LAST_URL})" ;;
-              *) echo "构建失败" ;;
+              success) echo "✅ 构建成功" ;;
+              skipped) echo "[⏭️ 无变更](${LAST_URL})" ;;
+              failure) echo "❌ 构建失败" ;;
+              cancelled) echo "⚠️ 已取消" ;;
+              *) echo "⚠️ $1" ;;
             esac
           }
 
@@ -835,14 +837,23 @@ jobs:
             echo "## VCP 自动构建"
             echo ""
             echo "构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
-            echo "最近一次发布：[${{ steps.tag.outputs.tag }}](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})"
             echo ""
-            echo "| 组件 | 状态 | 上游提交 |"
+            echo "| 组件 | 结果 | 上游提交 |"
             echo "| --- | --- | --- |"
             echo "| 服务端 VCPToolBox | $(state "${{ needs.backend.result }}") | \`${{ needs.detect.outputs.backend_sha }}\` |"
             echo "| 移动端 VCPMobile | $(state "${{ needs.mobile.result }}") | \`${{ needs.detect.outputs.mobile_sha }}\` |"
             echo "| 桌面端 VCPChat | $(state "${{ needs.desktop.result }}") | \`${{ needs.detect.outputs.desktop_sha }}\` |"
             echo ""
+            echo "「无变更」表示上游这轮没有新提交，不代表出错。点进去可以下载上一次的成品。"
+            echo ""
+
+            # 有失败时明确写出来，别让用户以为是正常发布
+            if [ "${{ needs.backend.result }}" = "failure" ] \
+               || [ "${{ needs.mobile.result }}" = "failure" ] \
+               || [ "${{ needs.desktop.result }}" = "failure" ]; then
+              echo "> ⚠️ **本次有组件构建失败**，失败的组件没有新产物，请到 [构建日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) 查看原因。"
+              echo ""
+            fi
 
             if ls release/*.apk >/dev/null 2>&1; then
               echo "### Android"
