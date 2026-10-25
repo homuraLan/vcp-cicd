@@ -32,18 +32,37 @@
 
 进入 [**Releases**](../../releases/latest) 页面，按需下载：
 
-| 文件 | 说明 |
-| :--- | :--- |
-| `VCPMobile-v<版本>-<hash>.apk` | 安卓安装包，传到手机点击安装 |
-| `VCPMobile-latest.apk` | 同上，固定名，适合收藏下载链接 |
-| `VCPChat-Setup-<版本>-<hash>.exe` | Windows 安装包，双击运行 |
-| `VCPChat-Portable-<版本>-<hash>.zip` | Windows 免安装版，解压即用 |
-| `vcptoolbox-<日期>-<hash>.tar.gz` | 服务端镜像归档，离线部署用 |
-| `SHA256SUMS.txt` | 校验清单 |
+| 文件 | 平台 | 说明 |
+| :--- | :--- | :--- |
+| `VCPMobile-v<版本>-<hash>.apk` | Android | 安装包，传到手机点击安装 |
+| `VCPMobile-latest.apk` | Android | 同上，固定名，适合收藏链接 |
+| `VCPChat-Setup-<版本>-<hash>.exe` | Windows | 安装包，双击运行 |
+| `VCPChat-Portable-<版本>-<hash>.zip` | Windows | 免安装版，解压即用 |
+| `vcptoolbox-<日期>-<hash>-linux-amd64.tar.gz` | Linux | 服务端二进制，解压即跑 |
 
 文件名里的 `<hash>` 是上游提交的短 SHA，能直接对上源码版本。
 
-> 也可以直接拉取服务端镜像：
+每个文件都配了同名的 `.sha256`，另有一份汇总的 `SHA256SUMS`：
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+Release 里只放成品和校验值，没有别的东西。
+
+### 服务端二进制的用法
+
+```bash
+tar -xzf vcptoolbox-<日期>-<hash>-linux-amd64.tar.gz
+cd app
+node main.js
+```
+
+依赖已全部内置（`node_modules`、`pydeps`、编好的原生模块），不用 `npm install`。
+包里的 `BUILD-INFO.txt` 写明提交、构建时间和运行环境。
+
+> 这个包按 Alpine/musl 构建。如果系统是 glibc（常见发行版都是），
+> 用容器镜像更方便：
 > ```bash
 > docker pull homuralan/vcptoolbox:latest      # 最新
 > docker pull homuralan/vcptoolbox:<hash>      # 固定到某个提交

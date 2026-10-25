@@ -58,6 +58,7 @@ jobs:
       mobile_sha: ${{ steps.check.outputs.mobile_sha }}
       desktop_sha: ${{ steps.check.outputs.desktop_sha }}
       any: ${{ steps.check.outputs.any }}
+      last_release_url: ${{ steps.last.outputs.release_url }}
 
     steps:
       # state 分支可能还不存在，所以不用 checkout action，
@@ -144,16 +145,53 @@ jobs:
           echo "any=$ANY" >> "$GITHUB_OUTPUT"
           echo "总体: any=$ANY"
 
-      - name: 检测结果
+      # 跳过的构建要在状态栏指出「去哪下载」，这里先查好最近一次成功的 Release
+      - name: 查最近一次成功发布
+        id: last
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          TAG=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || echo "")
+          if [ -n "$TAG" ]; then
+            URL="https://github.com/${{ github.repository }}/releases/tag/$TAG"
+            echo "最近一次发布: $TAG"
+          else
+            URL="https://github.com/${{ github.repository }}/releases"
+            echo "暂无可用的历史发布"
+          fi
+          echo "release_url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: 检测结果
+        env:
+          LAST_URL: ${{ steps.last.outputs.release_url }}
+        run: |
+          set -euo pipefail
+
+          # 跳过的组件不是「没东西」，而是「已经在别处发过了」，要给个跳转链接
+          mark() {
+            if [ "$1" = "true" ]; then
+              echo "本次构建"
+            else
+              echo "[无更新，用最近一版](${LAST_URL})"
+            fi
+          }
+
           {
             echo "### 上游检测"
             echo ""
-            echo "| 组件 | 本次 | 上游提交 |"
+            echo "| 组件 | 本次动作 | 上游提交 |"
             echo "| --- | --- | --- |"
-            echo "| VCPToolBox | ${{ steps.check.outputs.backend }} | \`${{ steps.check.outputs.backend_sha }}\` |"
-            echo "| VCPMobile | ${{ steps.check.outputs.mobile }} | \`${{ steps.check.outputs.mobile_sha }}\` |"
-            echo "| VCPChat | ${{ steps.check.outputs.desktop }} | \`${{ steps.check.outputs.desktop_sha }}\` |"
+            echo "| VCPToolBox | $(mark "${{ steps.check.outputs.backend }}") | \`${{ steps.check.outputs.backend_sha }}\` |"
+            echo "| VCPMobile | $(mark "${{ steps.check.outputs.mobile }}") | \`${{ steps.check.outputs.mobile_sha }}\` |"
+            echo "| VCPChat | $(mark "${{ steps.check.outputs.desktop }}") | \`${{ steps.check.outputs.desktop_sha }}\` |"
+            echo ""
+            if [ "$LAST_URL" != "" ]; then
+              echo "最近一次发布：${LAST_URL}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ============ 1. 服务端 ============
@@ -250,19 +288,69 @@ jobs:
           fi
           python3 ci/scripts/update-dockerhub-desc.py
 
-      - name: 导出镜像
+      - name: 导出 Linux 二进制
+        id: bin
         run: |
-          # 文件名带上日期与上游短 hash，一眼看出是哪次构建
-          NAME="vcptoolbox-$(date -u '+%Y%m%d')-${{ steps.meta.outputs.short }}"
-          docker save "vcptoolbox:build" | gzip -1 > "$NAME.tar.gz"
-          ls -lh vcptoolbox-*.tar.gz
-          echo "IMAGE_SHA=$(sha256sum "$NAME.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          set -euo pipefail
+
+          SHORT="${{ steps.meta.outputs.short }}"
+          SHA="${{ steps.meta.outputs.sha }}"
+          DATE=$(date -u '+%Y%m%d')
+          NAME="vcptoolbox-${DATE}-${SHORT}-linux-amd64"
+          IMAGE_TAG="${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox:${SHORT}"
+          mkdir -p pkg
+
+          # 从构建好的镜像里取出应用目录，而不是发布整包镜像
+          CID=$(docker create "vcptoolbox:build")
+          docker export "$CID" | tar -x -C pkg ./usr/src/app 2>/dev/null || true
+          docker rm "$CID" >/dev/null
+
+          if [ ! -d pkg/usr/src/app ]; then
+            echo "::error::未能从镜像中取出应用目录"
+            exit 1
+          fi
+          mv pkg/usr/src/app pkg/app
+          rm -rf pkg/usr
+
+          # 构建信息，跟二进制放在一起
+          NODE_V=$(docker run --rm --entrypoint node "vcptoolbox:build" -v 2>/dev/null | head -1)
+          {
+            echo "VCPToolBox ${NAME}"
+            echo "============================================"
+            echo ""
+            echo "项目       VCPToolBox"
+            echo "提交       ${SHA}"
+            echo "短提交     ${SHORT}"
+            echo "构建时间   $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "构建环境   GitHub Actions / ubuntu-latest"
+            echo "运行时     ${NODE_V:-node 20} on Alpine Linux (musl)"
+            echo ""
+            echo "安装"
+            echo "------------"
+            echo "解压后得到 app/ 目录，即应用根目录："
+            echo ""
+            echo "  tar -xzf ${NAME}.tar.gz"
+            echo "  cd app"
+            echo "  node main.js"
+            echo ""
+            echo "依赖已内置（node_modules、pydeps、编好的原生模块），无需 npm install。"
+            echo ""
+            echo "注意"
+            echo "------------"
+            echo "本包为 Alpine(musl) 构建，需要 glibc 的系统请改用 Docker 镜像："
+            echo "  docker pull ${IMAGE_TAG}"
+          } > pkg/app/BUILD-INFO.txt
+
+          tar -czf "${NAME}.tar.gz" -C pkg app
+          ls -lh "${NAME}.tar.gz"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -c %s "${NAME}.tar.gz")" >> "$GITHUB_OUTPUT"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: backend
-          path: vcptoolbox-*.tar.gz
+          path: "*.tar.gz"
           retention-days: 7
           compression-level: 0
 
@@ -272,7 +360,7 @@ jobs:
             echo "### 服务端"
             echo ""
             echo "- 提交: \`${{ steps.meta.outputs.sha }}\`"
-            echo "- 镜像归档 SHA256: \`$IMAGE_SHA\`"
+            echo "- Linux 二进制: \`${{ steps.bin.outputs.name }}.tar.gz\`"
             echo "- Docker Hub: \`${{ steps.build.outputs.image }}:${{ steps.meta.outputs.short }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -637,12 +725,16 @@ jobs:
   release:
     name: 发布 Release
     needs: [detect, backend, mobile, desktop]
+    # 有组件构建成功才发布；全部跳过时既不建 Release，也不该报失败
     if: |
       always()
       && !cancelled()
       && (needs.backend.result == 'success' || needs.mobile.result == 'success' || needs.desktop.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
 
     steps:
       - name: 生成版本标签
@@ -660,14 +752,17 @@ jobs:
 
       - name: 整理产物
         run: |
+          set -euo pipefail
           mkdir -p release
-          # 只收二进制成品与校验清单，跳过下载页用的 html
+
+          # 只收可以直接下载使用的二进制成品。
+          # .json/.html 是分发站用的元数据和下载页，不属于成品，不放进来。
           for d in artifacts/*/; do
             name=$(basename "$d")
             find "$d" -type f \
               \( -name '*.apk' -o -name '*.exe' -o -name '*.msi' -o -name '*.msix' \
-                 -o -name '*.7z' -o -name '*.zip' -o -name '*.blockmap' \
-                 -o -name '*.tar.gz' -o -name '*.yml' -o -name '*.json' \) | while read -r f; do
+                 -o -name '*.appx' -o -name '*.7z' -o -name '*.zip' \
+                 -o -name '*.blockmap' -o -name '*.tar.gz' \) | while read -r f; do
               base=$(basename "$f")
               dest="release/$base"
               # 同名文件加来源前缀，避免互相覆盖
@@ -677,36 +772,71 @@ jobs:
               cp "$f" "$dest"
             done
           done
+
+          COUNT=$(find release -type f | wc -l)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::没有收集到任何二进制成品"
+            exit 1
+          fi
+
           echo "=== 收集到的成品"
           find release -type f -printf '%10s  %p\n' | sort -k2
 
-      - name: 生成校验清单
+      - name: 生成校验值
         run: |
+          set -euo pipefail
           cd release
-          # 用 find -print0 + xargs -0，文件名含空格也不怕
-          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -print0 \
+          # 每个成品一个 SHA256.txt，便于单独校验，也是常见分发习惯
+          for f in *; do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *.sha256|*.txt) continue ;;
+            esac
+            sha256sum "$f" > "$f.sha256"
+            cat "$f.sha256"
+          done
+
+      - name: 生成汇总清单
+        run: |
+          set -euo pipefail
+          cd release
+          # 汇总清单：文件名保持通用惯例
+          find . -maxdepth 1 -type f -name '*.sha256' -print0 \
             | sort -z \
-            | xargs -0 -r sha256sum > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+            | xargs -0 -r cat > SHA256SUMS
+          echo "=== SHA256SUMS"
+          cat SHA256SUMS
 
       - name: 生成发布说明
+        env:
+          LAST_URL: ${{ needs.detect.outputs.last_release_url }}
         run: |
+          set -euo pipefail
+
+          # 这次没重建的组件，指向最近一次发布，避免用户以为「没有」
+          state() {
+            case "$1" in
+              success) echo "本次构建" ;;
+              skipped) echo "[未变更](${LAST_URL})" ;;
+              *) echo "构建失败" ;;
+            esac
+          }
+
           {
             echo "## VCP 自动构建"
             echo ""
-            echo "构建时间: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "最近一次发布：[${{ steps.tag.outputs.tag }}](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})"
             echo ""
-            echo "| 组件 | 状态 |"
-            echo "| --- | --- |"
-            echo "| 服务端 VCPToolBox | ${{ needs.backend.result }} |"
-            echo "| 移动端 VCPMobile | ${{ needs.mobile.result }} |"
-            echo "| 桌面端 VCPChat | ${{ needs.desktop.result }} |"
-            echo ""
-            echo "### 下载"
+            echo "| 组件 | 状态 | 上游提交 |"
+            echo "| --- | --- | --- |"
+            echo "| 服务端 VCPToolBox | $(state "${{ needs.backend.result }}") | \`${{ needs.detect.outputs.backend_sha }}\` |"
+            echo "| 移动端 VCPMobile | $(state "${{ needs.mobile.result }}") | \`${{ needs.detect.outputs.mobile_sha }}\` |"
+            echo "| 桌面端 VCPChat | $(state "${{ needs.desktop.result }}") | \`${{ needs.detect.outputs.desktop_sha }}\` |"
             echo ""
 
             if ls release/*.apk >/dev/null 2>&1; then
-              echo "**Android**"
+              echo "### Android"
               echo ""
               for f in release/*.apk; do
                 echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"
@@ -714,10 +844,10 @@ jobs:
               echo ""
             fi
 
-            if ls release/*.exe release/*.zip release/*.msi >/dev/null 2>&1; then
-              echo "**Windows**"
+            if ls release/*.exe >/dev/null 2>&1 || ls release/*.zip >/dev/null 2>&1; then
+              echo "### Windows"
               echo ""
-              for f in release/*.exe release/*.zip release/*.msi; do
+              for f in release/*.exe release/*.zip; do
                 [ -f "$f" ] || continue
                 echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"
               done
@@ -725,25 +855,32 @@ jobs:
             fi
 
             if ls release/*.tar.gz >/dev/null 2>&1; then
-              echo "**服务端**"
+              echo "### Linux"
               echo ""
               for f in release/*.tar.gz; do
                 echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"
               done
               echo ""
               echo '```bash'
-              echo 'gunzip -c vcptoolbox-*.tar.gz | docker load'
+              echo 'tar -xzf vcptoolbox-*.tar.gz'
+              echo 'cd app && node main.js'
               echo '```'
               echo ""
-              echo "或直接拉取：\`docker pull homuralan/vcptoolbox:latest\`"
+              echo "包内附 \`BUILD-INFO.txt\`，写明提交、构建时间和运行环境。"
+              echo ""
+              echo "也可以直接用容器镜像：\`docker pull ${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox:latest\`"
               echo ""
             fi
 
-            echo "### 校验"
-            echo ""
-            echo '```bash'
-            echo 'sha256sum -c SHA256SUMS.txt'
-            echo '```'
+            if [ -s release/SHA256SUMS ]; then
+              echo "### 校验"
+              echo ""
+              echo '```bash'
+              echo 'sha256sum -c SHA256SUMS'
+              echo '```'
+              echo ""
+              echo "每个成品也都单独附了 \`.sha256\` 文件。"
+            fi
           } > RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
@@ -805,3 +942,47 @@ jobs:
             git push origin state
             echo "状态已更新"
           fi
+
+  # ============ 5. 运行摘要 ============
+  # 保证无论本次是「全跳过」还是「有产出」，运行结束后都有一份带链接的说明
+  summary:
+    name: 构建摘要
+    needs: [detect, backend, mobile, desktop, release]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 写运行摘要
+        env:
+          LAST_URL: ${{ needs.detect.outputs.last_release_url }}
+          NEW_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          mark() {
+            case "$1" in
+              success) echo "✅ 本次构建" ;;
+              skipped) echo "⏭️ 无变更" ;;
+              failure) echo "❌ 失败" ;;
+              *) echo "$1" ;;
+            esac
+          }
+
+          {
+            echo "## VCP 构建结果"
+            echo ""
+            echo "| 组件 | 结果 | 上游提交 |"
+            echo "| --- | --- | --- |"
+            echo "| 服务端 VCPToolBox | $(mark "${{ needs.backend.result }}") | \`${{ needs.detect.outputs.backend_sha }}\` |"
+            echo "| 移动端 VCPMobile | $(mark "${{ needs.mobile.result }}") | \`${{ needs.detect.outputs.mobile_sha }}\` |"
+            echo "| 桌面端 VCPChat | $(mark "${{ needs.desktop.result }}") | \`${{ needs.detect.outputs.desktop_sha }}\` |"
+            echo ""
+            if [ -n "${NEW_TAG:-}" ]; then
+              echo "本次发布：[$NEW_TAG](${{ github.server_url }}/${{ github.repository }}/releases/tag/$NEW_TAG)"
+            fi
+            if [ -n "${LAST_URL:-}" ]; then
+              echo ""
+              echo "最近一次发布（未变更的组件在这里下载）：$LAST_URL"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
