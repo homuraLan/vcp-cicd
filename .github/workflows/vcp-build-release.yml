@@ -103,23 +103,33 @@ jobs:
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
       - name: 推送镜像到 Docker Hub
-        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        env:
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
+          if [ -z "$DH_TOKEN" ]; then
+            echo "未配置 Docker Hub 凭证，跳过推送"
+            exit 0
+          fi
           IMAGE="${{ steps.build.outputs.image }}"
           SHORT="${{ steps.meta.outputs.short }}"
           echo "登录 Docker Hub"
-          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
           docker push "$IMAGE:$SHORT"
           docker push "$IMAGE:latest"
           echo "已推送 $IMAGE:$SHORT 与 $IMAGE:latest"
 
       - name: 更新 Docker Hub 仓库说明
-        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
         env:
           DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           UPSTREAM_SHA: ${{ steps.meta.outputs.sha }}
-        run: python3 ci/scripts/update-dockerhub-desc.py
+        run: |
+          if [ -z "$DH_TOKEN" ]; then
+            echo "未配置凭证，跳过"
+            exit 0
+          fi
+          python3 ci/scripts/update-dockerhub-desc.py
 
       - name: 导出镜像
         run: |
@@ -576,7 +586,7 @@ jobs:
               echo 'gunzip -c vcptoolbox-*.tar.gz | docker load'
               echo '```'
               echo ""
-              echo "或直接拉取：\`docker pull ${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox:latest\`"
+              echo "或直接拉取：\`docker pull homuralan/vcptoolbox:latest\`"
               echo ""
             fi
 
