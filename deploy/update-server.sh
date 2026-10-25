@@ -173,11 +173,15 @@ if [ -n "$HEALTH_URL" ]; then
   ALT_URL="http://${HOST}:6006/"
 
   log "等待服务就绪（$HEALTH_URL）"
+  # 先给容器几秒起来，省得第一轮全是连接拒绝
+  sleep 5
   ok=false
   code=""
   for i in $(seq 1 40); do
     for u in "$HEALTH_URL" "$ALT_URL"; do
-      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$u" 2>/dev/null)
+      # 容器刚起时连接会被拒（curl 退出码 7），set -e 下必须兜住，
+      # 否则整个脚本在这里直接死掉，看不出是「还没起来」还是「起不来」
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$u" 2>/dev/null || true)
       case "$code" in
         200|301|302|307|401|403) ok=true; break 2 ;;
       esac
