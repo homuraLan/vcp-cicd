@@ -329,23 +329,21 @@ jobs:
         run: |
           # 托管 windows 镜像已切换到 Visual Studio 2026，
           # 依赖自带的 node-gyp 太旧，识别不出新版本号，会直接放弃。
+          # 升级后通过环境变量让 npm 优先使用这个全局版本。
           npm install -g node-gyp@latest
+          $gypRoot = (npm root -g).Trim()
+          "npm_config_node_gyp=$gypRoot\node-gyp\bin\node-gyp.js" >> $env:GITHUB_ENV
           node-gyp --version
 
-      - name: 安装依赖（允许原生模块编译失败）
+      - name: 下载依赖（不编译）
         shell: pwsh
         working-directory: src
         run: |
-          # 这一步只负责把源码下载下来。原生模块此时可能编译失败
-          # （Spectre 组件缺失 / VS 版本不识别），下面修正后会重新编译。
-          npm install --omit=optional --ignore-scripts
+          # 只下载源码，跳过全部安装脚本。
+          # 原生模块统一在修正 gyp 配置后编译，避免中途失败中断流程。
+          npm install --omit=optional --ignore-scripts --no-audit --no-fund
           if ($LASTEXITCODE -ne 0) { throw "依赖下载失败" }
-
-          # 单独跑一次安装脚本，失败不中断
-          npm rebuild --ignore-scripts=false 2>&1 | Select-Object -Last 5
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::warning::原生模块首次编译未通过，将在修正后重试"
-          }
+          Write-Host "依赖下载完成"
 
       - name: 修正原生模块编译环境
         shell: pwsh
