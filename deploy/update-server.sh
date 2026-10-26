@@ -14,14 +14,20 @@
 #   DEPLOY_DIR     部署目录（必填）
 #   TARGET_IMAGE   目标镜像，如 homuralan/vcptoolbox:add5dbb5（必填）
 #   TARGET_SHA     目标上游提交（可选，用于记录）
+#   TARGET_TAG     目标发布标签（可选，用于算拉取间隔）
 #   HEALTH_URL     健康检查地址（可选）
+#   INTERVAL_H     本机多久拉一次，小时；0 表示不自动拉（可选，默认 6）
+#   FORCE          设为 1 忽略间隔，立刻拉（手动触发时用）
 
 set -euo pipefail
 
 DEPLOY_DIR="${DEPLOY_DIR:?必须指定 DEPLOY_DIR}"
 TARGET_IMAGE="${TARGET_IMAGE:?必须指定 TARGET_IMAGE}"
 TARGET_SHA="${TARGET_SHA:-}"
+TARGET_TAG="${TARGET_TAG:-}"
 HEALTH_URL="${HEALTH_URL:-}"
+INTERVAL_H="${INTERVAL_H:-6}"
+FORCE="${FORCE:-0}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
@@ -29,6 +35,21 @@ cd "$DEPLOY_DIR" || { echo "部署目录不存在: $DEPLOY_DIR"; exit 1; }
 
 OVER_BACKUP="$DEPLOY_DIR/.override.backup"
 PREV_IMAGE=""
+POLICY_STAMP="$DEPLOY_DIR/.last-pull.at"
+
+# ---- 0. 到间隔了没有 ----
+# 上游照常编译，这里管的是本机多久去拉一次。
+# 时间戳落在部署目录里，跨次运行留得住；托管 runner 上没有这个目录。
+if [ "$FORCE" != "1" ] && [ "$INTERVAL_H" != "0" ] && [ -f "$POLICY_STAMP" ]; then
+  LAST_AT=$(cat "$POLICY_STAMP" 2>/dev/null || echo 0)
+  NOW_AT=$(date -u +%s)
+  GAP=$(( NOW_AT - LAST_AT ))
+  LIMIT=$(( INTERVAL_H * 3600 ))
+  if [ "$GAP" -lt "$LIMIT" ]; then
+    log "距上次拉取 ${GAP}s，未到 ${LIMIT}s（间隔 ${INTERVAL_H}h），本次跳过"
+    exit 0
+  fi
+fi
 
 # ---- 1. 已经在跑目标版本就不用动 ----
 if [ -f docker-compose.override.yml ]; then
@@ -37,6 +58,8 @@ fi
 
 if [ "$PREV_IMAGE" = "$TARGET_IMAGE" ]; then
   log "已在运行 $TARGET_IMAGE，无需更新"
+  # 版本没变也刷新时间戳，免得每隔一次定时就跑一遍检查
+  date -u +%s > "$POLICY_STAMP" 2>/dev/null || true
   exit 0
 fi
 
@@ -200,6 +223,11 @@ log "更新完成: $TARGET_IMAGE"
 if [ -n "$TARGET_SHA" ]; then
   echo "$TARGET_SHA" > .deployed-sha
   log "记录提交: ${TARGET_SHA:0:8}"
+fi
+# 记下这次拉取时间，下次按间隔判断是否该再拉
+date -u +%s > "$POLICY_STAMP" 2>/dev/null || true
+if [ -n "$TARGET_TAG" ]; then
+  echo "$TARGET_TAG" > .deployed-tag
 fi
 
 docker compose ps

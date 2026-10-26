@@ -59,6 +59,9 @@ jobs:
       desktop_sha: ${{ steps.check.outputs.desktop_sha }}
       any: ${{ steps.check.outputs.any }}
       last_release_url: ${{ steps.last.outputs.release_url }}
+      backend_url: ${{ steps.last.outputs.backend_url }}
+      mobile_url: ${{ steps.last.outputs.mobile_url }}
+      desktop_url: ${{ steps.last.outputs.desktop_url }}
       backend_version: ${{ steps.ver.outputs.backend_version }}
       mobile_version: ${{ steps.ver.outputs.mobile_version }}
       desktop_version: ${{ steps.ver.outputs.desktop_version }}
@@ -149,25 +152,57 @@ jobs:
           echo "any=$ANY" >> "$GITHUB_OUTPUT"
           echo "总体: any=$ANY"
 
-      # 跳过的构建要在状态栏指出「去哪下载」，这里先查好最近一次成功的 Release
-      - name: 查最近一次成功发布
+      # 跳过的构建要指出「去哪下载」，但必须指向真正包含该组件成品的那一版。
+      # 不能直接取 /releases/latest：那是最近一次发布，可能只构建了服务端，
+      # 于是桌面端被指到一版没有桌面端产物的发布，再指一版……最后指到没有成品的那版。
+      - name: 查各组件的最近一次成品
         id: last
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+
+          # 逐页往前翻，找到第一个带目标产物的发布就停。
+          # 3 页 × 30 条足够覆盖很久了，再往前翻纯属浪费 API 配额。
+          # python 必须写成单行：多行代码会从第 0 列开始，破坏 run 块缩进。
+          find_release() {
+            pattern="$1"
+            for page in 1 2 3; do
+              hit=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/releases?per_page=30&page=$page" \
+                | PATTERN="$pattern" python3 -c "import sys,os,json,fnmatch; p=os.environ['PATTERN']; d=json.load(sys.stdin); d=d if isinstance(d,list) else []; ms=[r.get('tag_name','') for r in d if not r.get('draft') for a in r.get('assets',[]) if fnmatch.fnmatch(a.get('name',''), p)]; print(ms[0] if ms else '')" 2>/dev/null || echo "")
+              if [ -n "$hit" ]; then
+                echo "$hit"
+                return
+              fi
+            done
+            echo ""
+          }
+
+          BASE="https://github.com/${{ github.repository }}/releases"
+          url_of() {
+            if [ -n "$1" ]; then echo "$BASE/tag/$1"; else echo "$BASE"; fi
+          }
+
+          BE=$(find_release 'vcptoolbox-*.tar.gz')
+          MB=$(find_release '*.apk')
+          DE=$(find_release '*Setup*.exe')
+
+          echo "backend_url=$(url_of "$BE")" >> "$GITHUB_OUTPUT"
+          echo "mobile_url=$(url_of "$MB")" >> "$GITHUB_OUTPUT"
+          echo "desktop_url=$(url_of "$DE")" >> "$GITHUB_OUTPUT"
+
+          echo "服务端成品: ${BE:-无}"
+          echo "移动端成品: ${MB:-无}"
+          echo "桌面端成品: ${DE:-无}"
+
+          # 整体兜底：三个里最新的那个，给不区分组件的场合用
+          LATEST=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
             | python3 -c "import sys,json;print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || echo "")
-          if [ -n "$TAG" ]; then
-            URL="https://github.com/${{ github.repository }}/releases/tag/$TAG"
-            echo "最近一次发布: $TAG"
-          else
-            URL="https://github.com/${{ github.repository }}/releases"
-            echo "暂无可用的历史发布"
-          fi
-          echo "release_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "release_url=$(url_of "$LATEST")" >> "$GITHUB_OUTPUT"
 
       - name: 检测结果
         env:
@@ -331,18 +366,24 @@ jobs:
             echo "::error::镜像构建失败"
             exit 1
           fi
-          # 多标签：
+          # 三个标签：
           #   <短hash>   精确对应一次上游提交，回滚用
-          #   <日期>     按天滚动，便于按时间找
+          #   v<版本>    对应上游版本号，跟 Release 标签对得上
           #   latest     日常拉取
           SHORT="${{ steps.meta.outputs.short }}"
-          DATE_TAG=$(date -u '+%Y%m%d')
+          VER="${{ steps.meta.outputs.version }}"
           IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox"
           docker tag "vcptoolbox:build" "$IMAGE:$SHORT"
-          docker tag "vcptoolbox:build" "$IMAGE:$DATE_TAG"
+          if [ -n "$VER" ]; then
+            docker tag "vcptoolbox:build" "$IMAGE:$VER"
+            echo "ver_tag=$VER" >> "$GITHUB_OUTPUT"
+          else
+            # 取不到上游版本时不给假标签，宁可少一个
+            echo "::warning::没有上游版本号，跳过版本标签"
+            echo "ver_tag=" >> "$GITHUB_OUTPUT"
+          fi
           docker tag "vcptoolbox:build" "$IMAGE:latest"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "date_tag=$DATE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: 推送镜像到 Docker Hub
         env:
@@ -355,12 +396,17 @@ jobs:
           fi
           IMAGE="${{ steps.build.outputs.image }}"
           SHORT="${{ steps.meta.outputs.short }}"
+          VER_TAG="${{ steps.build.outputs.ver_tag }}"
           echo "登录 Docker Hub"
           echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
+          PUSHED=":$SHORT"
           docker push "$IMAGE:$SHORT"
-          docker push "$IMAGE:${{ steps.build.outputs.date_tag }}"
+          if [ -n "$VER_TAG" ]; then
+            docker push "$IMAGE:$VER_TAG"
+            PUSHED="$PUSHED / :$VER_TAG"
+          fi
           docker push "$IMAGE:latest"
-          echo "已推送 $IMAGE:$SHORT / :${{ steps.build.outputs.date_tag }} / :latest"
+          echo "已推送 $IMAGE$PUSHED / :latest"
 
       - name: 更新 Docker Hub 仓库说明
         env:
@@ -935,21 +981,23 @@ jobs:
           cat SHA256SUMS
 
       - name: 生成发布说明
-        env:
-          LAST_URL: ${{ needs.detect.outputs.last_release_url }}
         run: |
           set -euo pipefail
 
-          # 状态要能直接看出成功还是失败，跳过的要说明去向
+          # 状态要能直接看出成功还是失败。跳过时要指向真正包含该组件成品的发布，
+          # 所以链接是按组件分别传进来的，不能统一用一个地址。
           state() {
             case "$1" in
               success) echo "✅ 构建成功" ;;
-              skipped) echo "[⏭️ 无变更](${LAST_URL})" ;;
+              skipped) echo "[⏭️ 无变更]($2)" ;;
               failure) echo "❌ 构建失败" ;;
               cancelled) echo "⚠️ 已取消" ;;
               *) echo "⚠️ $1" ;;
             esac
           }
+          BE_URL="${{ needs.detect.outputs.backend_url }}"
+          MB_URL="${{ needs.detect.outputs.mobile_url }}"
+          DE_URL="${{ needs.detect.outputs.desktop_url }}"
 
           {
             echo "## VCP 自动构建"
@@ -958,13 +1006,13 @@ jobs:
             echo ""
             echo "| 组件 | 版本 | 结果 | 上游提交 |"
             echo "| --- | --- | --- | --- |"
-            echo "| 服务端 VCPToolBox | \`${{ needs.detect.outputs.backend_version }}\` | $(state "${{ needs.backend.result }}") | \`${{ needs.detect.outputs.backend_sha }}\` |"
-            echo "| 移动端 VCPMobile | \`${{ needs.detect.outputs.mobile_version }}\` | $(state "${{ needs.mobile.result }}") | \`${{ needs.detect.outputs.mobile_sha }}\` |"
-            echo "| 桌面端 VCPChat | \`${{ needs.detect.outputs.desktop_version }}\` | $(state "${{ needs.desktop.result }}") | \`${{ needs.detect.outputs.desktop_sha }}\` |"
+            echo "| 服务端 VCPToolBox | \`${{ needs.detect.outputs.backend_version }}\` | $(state "${{ needs.backend.result }}" "$BE_URL") | \`${{ needs.detect.outputs.backend_sha }}\` |"
+            echo "| 移动端 VCPMobile | \`${{ needs.detect.outputs.mobile_version }}\` | $(state "${{ needs.mobile.result }}" "$MB_URL") | \`${{ needs.detect.outputs.mobile_sha }}\` |"
+            echo "| 桌面端 VCPChat | \`${{ needs.detect.outputs.desktop_version }}\` | $(state "${{ needs.desktop.result }}" "$DE_URL") | \`${{ needs.detect.outputs.desktop_sha }}\` |"
             echo ""
             echo "版本号取自上游仓库的最新 tag，与实际构建的代码一致。"
             echo ""
-            echo "「无变更」表示上游这轮没有新提交，不代表出错。点进去可以下载上一次的成品。"
+            echo "「无变更」表示上游这轮没有新提交，不代表出错。点进去是该组件最近一次真正构建出来的成品。"
             echo ""
 
             # 有失败时明确写出来，别让用户以为是正常发布
@@ -1198,15 +1246,19 @@ jobs:
     steps:
       - name: 写运行摘要
         env:
-          LAST_URL: ${{ needs.detect.outputs.last_release_url }}
           NEW_TAG: ${{ needs.release.outputs.tag }}
         run: |
           set -euo pipefail
 
+          BE_URL="${{ needs.detect.outputs.backend_url }}"
+          MB_URL="${{ needs.detect.outputs.mobile_url }}"
+          DE_URL="${{ needs.detect.outputs.desktop_url }}"
+
+          # 跳过的组件要去它自己最近一次真正构建出来的那一版，逐个指路
           mark() {
             case "$1" in
               success) echo "✅ 本次构建" ;;
-              skipped) echo "⏭️ 无变更" ;;
+              skipped) echo "⏭️ [无变更]($2)" ;;
               failure) echo "❌ 失败" ;;
               *) echo "$1" ;;
             esac
@@ -1215,17 +1267,13 @@ jobs:
           {
             echo "## VCP 构建结果"
             echo ""
-            echo "| 组件 | 结果 | 上游提交 |"
-            echo "| --- | --- | --- |"
-            echo "| 服务端 VCPToolBox | $(mark "${{ needs.backend.result }}") | \`${{ needs.detect.outputs.backend_sha }}\` |"
-            echo "| 移动端 VCPMobile | $(mark "${{ needs.mobile.result }}") | \`${{ needs.detect.outputs.mobile_sha }}\` |"
-            echo "| 桌面端 VCPChat | $(mark "${{ needs.desktop.result }}") | \`${{ needs.detect.outputs.desktop_sha }}\` |"
+            echo "| 组件 | 版本 | 结果 | 上游提交 |"
+            echo "| --- | --- | --- | --- |"
+            echo "| 服务端 VCPToolBox | \`${{ needs.detect.outputs.backend_version }}\` | $(mark "${{ needs.backend.result }}" "$BE_URL") | \`${{ needs.detect.outputs.backend_sha }}\` |"
+            echo "| 移动端 VCPMobile | \`${{ needs.detect.outputs.mobile_version }}\` | $(mark "${{ needs.mobile.result }}" "$MB_URL") | \`${{ needs.detect.outputs.mobile_sha }}\` |"
+            echo "| 桌面端 VCPChat | \`${{ needs.detect.outputs.desktop_version }}\` | $(mark "${{ needs.desktop.result }}" "$DE_URL") | \`${{ needs.detect.outputs.desktop_sha }}\` |"
             echo ""
             if [ -n "${NEW_TAG:-}" ]; then
               echo "本次发布：[$NEW_TAG](${{ github.server_url }}/${{ github.repository }}/releases/tag/$NEW_TAG)"
-            fi
-            if [ -n "${LAST_URL:-}" ]; then
-              echo ""
-              echo "最近一次发布（未变更的组件在这里下载）：$LAST_URL"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

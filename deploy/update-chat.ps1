@@ -9,14 +9,18 @@
 #   - 静默安装，装完能检测到新版本
 #
 # 参数：
-#   -Tag        目标发布标签，如 v2026.10.25-13
-#   -DeployDir  安装目录（默认取仓库变量）
-#   -Repo       仓库全名
+#   -Tag          目标发布标签，如 v2026.10.25-13
+#   -DeployDir    安装目录（默认取仓库变量）
+#   -Repo         仓库全名
+#   -IntervalHours 本机多久拉一次，0 表示不自动拉（默认 6）
+#   -Force        忽略间隔，立刻拉
 
 param(
     [Parameter(Mandatory = $true)][string]$Tag,
     [string]$DeployDir = "",
-    [string]$Repo = "homuraLan/vcp-cicd"
+    [string]$Repo = "homuraLan/vcp-cicd",
+    [int]$IntervalHours = 6,
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,12 +37,32 @@ if (-not $DeployDir) {
     }
 }
 
+# ---- 0. 到间隔了没有 ----
+# 上游照常编译，这里管的是本机多久去拉一次。
+$pullStamp = Join-Path $DeployDir ".last-pull.at"
+if (-not $Force -and $IntervalHours -gt 0 -and (Test-Path $pullStamp)) {
+    $lastRaw = (Get-Content $pullStamp -Raw).Trim()
+    $lastAt = 0
+    if ([int64]::TryParse($lastRaw, [ref]$lastAt) -and $lastAt -gt 0) {
+        $gap = [int64]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) - $lastAt
+        $limit = [int64]$IntervalHours * 3600
+        if ($gap -lt $limit) {
+            Log ("距上次拉取 {0}s，未到 {1}s（间隔 {2}h），本次跳过" -f $gap, $limit, $IntervalHours)
+            exit 0
+        }
+    }
+}
+
 # ---- 1. 幂等检查 ----
 $stampFile = Join-Path $DeployDir ".deployed-tag"
 if (Test-Path $stampFile) {
     $current = (Get-Content $stampFile -Raw).Trim()
     if ($current -eq $Tag) {
         Log "已部署 $Tag，无需更新"
+        # 版本没变也刷新时间戳，免得每隔一次定时就跑一遍检查
+        try {
+            [System.IO.File]::WriteAllText($pullStamp, [string]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()))
+        } catch { }
         exit 0
     }
     Log "当前版本: $current"
@@ -126,7 +150,9 @@ try {
         Log "解压完成"
     }
 
-    Set-Content -Path $stampFile -Value $Tag -NoNewline -Encoding utf8
+    # 5.1 的 Set-Content -Encoding utf8 会写 BOM，下次读出来带 \ufeff 就比不相等了
+    [System.IO.File]::WriteAllText($stampFile, $Tag, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($pullStamp, [string]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()))
     Log "更新完成: $Tag"
 }
 catch {

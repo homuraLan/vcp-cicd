@@ -38,7 +38,7 @@
 | `VCPMobile-latest.apk` | Android | 同上，固定名，适合收藏链接 |
 | `VCPChat-Setup-<版本>-<hash>.exe` | Windows | 安装包，双击运行 |
 | `VCPChat-Portable-<版本>-<hash>.zip` | Windows | 免安装版，解压即用 |
-| `vcptoolbox-<日期>-<hash>-linux-amd64.tar.gz` | Linux | 服务端二进制，解压即跑 |
+| `vcptoolbox-<版本>-<hash>-linux-amd64.tar.gz` | Linux | 服务端二进制，解压即跑 |
 
 文件名里的 `<hash>` 是上游提交的短 SHA，能直接对上源码版本。
 
@@ -50,23 +50,31 @@ sha256sum -c SHA256SUMS
 
 Release 里只放成品和校验值，没有别的东西。
 
-### 服务端二进制的用法
+### 服务端也有免安装的二进制包
+
+除了 Docker 镜像，服务端同样提供二进制的 tar 包，**不装 Docker 也能直接跑**。
 
 ```bash
-tar -xzf vcptoolbox-<日期>-<hash>-linux-amd64.tar.gz
+tar -xzf vcptoolbox-<版本>-<hash>-linux-amd64.tar.gz
 cd app
 node main.js
 ```
 
-依赖已全部内置（`node_modules`、`pydeps`、编好的原生模块），不用 `npm install`。
+依赖已全部内置（`node_modules`、`pydeps`、编好的原生模块、插件里用 Rust 写的
+子程序），不用 `npm install`，也不用装编译器。
+
 包里的 `BUILD-INFO.txt` 写明提交、构建时间和运行环境。
 
 > 这个包按 Alpine/musl 构建。如果系统是 glibc（常见发行版都是），
-> 用容器镜像更方便：
+> 用容器镜像更省事：
 > ```bash
-> docker pull homuralan/vcptoolbox:latest      # 最新
-> docker pull homuralan/vcptoolbox:<hash>      # 固定到某个提交
+> docker pull homuralan/vcptoolbox:latest         # 最新
+> docker pull homuralan/vcptoolbox:v1.13.0        # 固定到某个上游版本
+> docker pull homuralan/vcptoolbox:<hash>         # 固定到某次上游提交
 > ```
+>
+> 三个标签指向同一个镜像，按用途挑：`latest` 日常用，`v<版本>` 跟着上游版本走，
+> `<hash>` 精确到提交，回滚时用它最稳。
 
 ## 各端说明
 
@@ -93,7 +101,7 @@ docker pull homuralan/vcptoolbox:latest
 | Tag | 说明 |
 | :--- | :--- |
 | `latest` | 最近一次成功构建 |
-| `20261025` 这样的日期 | 当天构建的版本 |
+| `v1.13.0` 这样的版本号 | 对应上游版本，跟 Release 标签对得上 |
 | `dd4f7032` 这样的短 hash | 精确对应某个上游提交，回滚用 |
 
 需要配置文件才能启动。参考上游 [VCPToolBox](https://github.com/lioensky/VCPToolBox) 的部署说明。
@@ -124,7 +132,7 @@ docker pull homuralan/vcptoolbox:latest
 用 SHA 比对，不依赖版本号或 tag。
 
 所以某次 Release 里只有一两个文件是**正常现象** —— 说明其它组件这轮没变。
-每次运行的摘要里都会链接到最近一次发布，从那里下载没变的组件即可。
+没变的组件，摘要里会分别给出它自己最近一次真正构建出来的那版链接。
 
 ## 常见问题
 
@@ -145,7 +153,29 @@ docker pull homuralan/vcptoolbox:latest
 <details>
 <summary><b>多久更新一次</b></summary>
 
-上游有新提交时自动构建，检查间隔 6 小时。
+分两层看，两层互不影响：
+
+**上游构建** —— 有新提交就编译，每 6 小时查一次上游。这一层不设频率限制，
+上游动了就构建，保证 Release 里永远是最新代码。
+
+**本机拉取** —— 已部署的机器多久去取一次新版本，每一端单独设：
+
+| 仓库变量 | 管什么 | 默认 |
+| :--- | :--- | :--- |
+| `VCP_SERVER_INTERVAL_H` | 服务端多久拉一次 | `6`（小时） |
+| `VCP_CHAT_INTERVAL_H` | 桌面端多久拉一次 | `6`（小时） |
+
+移动端没有这一项：APK 只是放在局域网下载页上，手机上什么时候装由你决定，
+不存在「自动拉取」这一步。
+
+改法：
+
+```bash
+gh variable set VCP_SERVER_INTERVAL_H --repo homuraLan/vcp-cicd --body "24"
+```
+
+填 `0` 表示该端不自动拉，只能手动触发。手动触发 `VCP 部署对齐` workflow
+会忽略间隔立刻对齐一次，升级完想马上验证时用这个。
 
 版本号直接沿用上游仓库的最新 tag，跟上游对得上：服务端是 `v1.13.0` 这种，
 移动端是 `v1.1.6`。同一上游版本重复构建时追加 `.N`（如 `v1.13.0.2`）保证唯一。
@@ -169,7 +199,8 @@ docker pull homuralan/vcptoolbox:latest
 
 因为这次只有 VCPMobile 上游更新了。按需构建，只编译有变化的组件。
 
-没变的组件直接从**最近一次发布**下载，每次运行的摘要里都有那个链接。
+没变的组件，摘要里会给出它**自己最近一次真正构建出来**的那版链接 ——
+不会指到一版没有该组件产物的发布上。
 
 </details>
 

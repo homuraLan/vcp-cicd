@@ -10,12 +10,18 @@ name: VCP 部署对齐
 #   - runner 每次上线都会自动领取排队任务，这里用短间隔定时扫
 #   - 也可以手动触发
 #
+# 更新频率：上游照常编译，这里控制的是本机多久去拉一次。
+# 每一端有自己的间隔，配在仓库变量里，改完下个整点生效：
+#   VCP_SERVER_INTERVAL_H   服务端，默认 6（小时，0 = 不自动拉）
+#   VCP_CHAT_INTERVAL_H     桌面端，默认 6
+# 没到间隔的端直接跳过，不会去查也不会去拉。
+#
 # 幂等：目标版本已在跑就直接退出，不会无谓重启服务。
 
 on:
   schedule:
-    # 每 30 分钟检查一次。runner 不在线时任务会排队，
-    # 上线后自动执行，等价于「上线就查询」。
+    # 每 30 分钟看一眼「到点没有」。真正的节奏由各端间隔决定，
+    # 所以这里越密集只是判定越准，不会因此拉得更勤。
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
@@ -27,7 +33,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # 先问一句：最新发布是什么，值不值得部署
+  # 先问一句：各端的最新成品是什么，到点没有，值不值得部署
   check:
     name: 检查线上版本
     runs-on: ubuntu-latest
@@ -35,60 +41,75 @@ jobs:
     outputs:
       tag: ${{ steps.latest.outputs.tag }}
       backend_sha: ${{ steps.latest.outputs.backend_sha }}
+      backend_tag: ${{ steps.latest.outputs.backend_tag }}
+      desktop_tag: ${{ steps.latest.outputs.desktop_tag }}
       has_backend: ${{ steps.latest.outputs.has_backend }}
       has_desktop: ${{ steps.latest.outputs.has_desktop }}
 
     steps:
-      - name: 查询最新发布
+      - name: 查询各端最新成品
         id: latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          REPO="${{ github.repository }}"
 
-          TAG=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-            | python3 -c "import sys,json;print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || echo "")
+          # 逐页往前翻，找第一个带目标产物的发布。
+          # 不能只看 /releases/latest：那一版可能只构建了服务端，
+          # 桌面端就被指到一版根本没有桌面端产物的发布。
+          # python 必须写成单行，多行会从第 0 列开始破坏 run 块缩进。
+          find_release() {
+            pattern="$1"
+            for page in 1 2 3; do
+              hit=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/releases?per_page=30&page=$page" \
+                | PATTERN="$pattern" python3 -c "import sys,os,json,fnmatch; p=os.environ['PATTERN']; d=json.load(sys.stdin); d=d if isinstance(d,list) else []; ms=[r.get('tag_name','') for r in d if not r.get('draft') for a in r.get('assets',[]) if fnmatch.fnmatch(a.get('name',''), p)]; print(ms[0] if ms else '')" 2>/dev/null || echo "")
+              if [ -n "$hit" ]; then echo "$hit"; return; fi
+            done
+            echo ""
+          }
 
-          if [ -z "$TAG" ]; then
-            echo "没有任何发布，无需对齐"
-            echo "has_backend=false" >> "$GITHUB_OUTPUT"
-            echo "has_desktop=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          # 到点没有由部署脚本自己判断（它跑在有持久磁盘的 runner 上，
+          # 记得住上次拉取时间）。这里只负责找出各端最新的成品。
+          BE_TAG=$(find_release 'vcptoolbox-*.tar.gz')
+          DE_TAG=$(find_release '*Setup*.exe')
+
+          TAG=""
+          if [ -n "$BE_TAG" ]; then TAG="$BE_TAG"; elif [ -n "$DE_TAG" ]; then TAG="$DE_TAG"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "最新发布: $TAG"
+          echo "backend_tag=$BE_TAG" >> "$GITHUB_OUTPUT"
+          echo "desktop_tag=$DE_TAG" >> "$GITHUB_OUTPUT"
 
-          # 从发布资产名反推服务端提交
-          ASSETS=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
-            | python3 -c "import sys,json;d=json.load(sys.stdin);print('\n'.join(a['name'] for a in d.get('assets',[])))" \
-            2>/dev/null || echo "")
-
-          BACKEND_SHA=""
           HAS_BACKEND=false
           HAS_DESKTOP=false
 
-          while IFS= read -r name; do
-            case "$name" in
-              vcptoolbox-*-linux-amd64.tar.gz)
-                # 新格式 vcptoolbox-1.13.0-add5dbb5-linux-amd64.tar.gz
-                # 老格式 vcptoolbox-20261025-add5dbb5-linux-amd64.tar.gz
-                # 两种都取最后那段 hash，兼容已发布的历史版本
-                BACKEND_SHA=$(echo "$name" | sed -E 's/^vcptoolbox-.*-([0-9a-f]{7,40})-linux-amd64\.tar\.gz$/\1/')
-                HAS_BACKEND=true
-                ;;
-              *Setup*.exe) HAS_DESKTOP=true ;;
-            esac
-          done <<< "$ASSETS"
+          if [ -n "$BE_TAG" ]; then
+            ASSETS=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/releases/tags/$BE_TAG" \
+              | python3 -c "import sys,json;d=json.load(sys.stdin);print('\n'.join(a['name'] for a in d.get('assets',[])))" 2>/dev/null || echo "")
+            while IFS= read -r name; do
+              case "$name" in
+                vcptoolbox-*-linux-amd64.tar.gz)
+                  # 新格式 vcptoolbox-1.13.0-add5dbb5-linux-amd64.tar.gz
+                  # 老格式 vcptoolbox-20261025-add5dbb5-linux-amd64.tar.gz
+                  # 两种都取最后那段 hash，兼容已发布的历史版本
+                  BACKEND_SHA=$(echo "$name" | sed -E 's/^vcptoolbox-.*-([0-9a-f]{7,40})-linux-amd64\.tar\.gz$/\1/')
+                  echo "backend_sha=$BACKEND_SHA" >> "$GITHUB_OUTPUT"
+                  HAS_BACKEND=true
+                  ;;
+              esac
+            done <<< "$ASSETS"
+          fi
+          if [ -n "$DE_TAG" ]; then HAS_DESKTOP=true; fi
 
-          echo "backend_sha=$BACKEND_SHA" >> "$GITHUB_OUTPUT"
+          echo "服务端最新成品: ${BE_TAG:-无}（提交 ${BACKEND_SHA:-无}）"
+          echo "桌面端最新成品: ${DE_TAG:-无}"
+
           echo "has_backend=$HAS_BACKEND" >> "$GITHUB_OUTPUT"
           echo "has_desktop=$HAS_DESKTOP" >> "$GITHUB_OUTPUT"
-          echo "服务端提交: ${BACKEND_SHA:-无}"
-          echo "桌面端成品: $HAS_DESKTOP"
 
   sync-server:
     name: 对齐服务端
@@ -110,7 +131,11 @@ jobs:
           DEPLOY_DIR: ${{ vars.VCP_SERVER_DIR }}
           TARGET_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox:${{ needs.check.outputs.backend_sha }}
           TARGET_SHA: ${{ needs.check.outputs.backend_sha }}
+          TARGET_TAG: ${{ needs.check.outputs.backend_tag }}
           HEALTH_URL: ${{ vars.VCP_SERVER_URL }}
+          # 本机多久拉一次，0 = 不自动拉；手动触发时无视间隔
+          INTERVAL_H: ${{ vars.VCP_SERVER_INTERVAL_H || '6' }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: |
           if [ -z "${DEPLOY_DIR:-}" ]; then
             echo "未配置仓库变量 VCP_SERVER_DIR，跳过"
@@ -155,8 +180,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHAT_DIR: ${{ vars.VCP_CHAT_DIR }}
-          TAG: ${{ needs.check.outputs.tag }}
+          # 用桌面端自己的那一版，不能用 tag：那一版可能只有服务端
+          TAG: ${{ needs.check.outputs.desktop_tag }}
           REPO: ${{ github.repository }}
+          INTERVAL_H: ${{ vars.VCP_CHAT_INTERVAL_H || '6' }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: |
           if (-not $env:CHAT_DIR) {
             Write-Host "VCP_CHAT_DIR not set, skip"
@@ -168,7 +196,10 @@ jobs:
           }
           $ErrorActionPreference = 'Stop'
           try {
-            & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo $env:REPO
+            $hours = 6
+            if ($env:INTERVAL_H) { [int]::TryParse($env:INTERVAL_H, [ref]$hours) | Out-Null }
+            $force = ($env:FORCE -eq '1')
+            & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo $env:REPO -IntervalHours $hours -Force:$force
             if (-not $?) { exit 1 }
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             exit 0
