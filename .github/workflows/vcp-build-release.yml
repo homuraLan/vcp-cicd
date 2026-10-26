@@ -107,7 +107,7 @@ jobs:
           # 就把这个数加一，让下一次运行即使上游没动也重新打一次包。
           # v2: 注入数据目录补丁（安装版启动无窗口）+ 写入日期版本号
           # v4: package.json 保持三段 SemVer，Windows 文件版本另用 build.win.fileVersion 写四段
-          RECIPE_VERSION=v4
+          RECIPE_VERSION=v5
 
           # 读取上次记录的提交，没有就当空
           prev() {
@@ -862,7 +862,8 @@ jobs:
             #
             # Windows 版本资源是四个独立 16 位整数，electron-builder 从 SemVer
             # 推 FileVersion 时会把 26 当成末段丢掉，实测显示成 2026.10.2-6.0。
-            # 所以额外在 build.win.fileVersion 里写死四段，让资源里是 2026.10.26.0。
+            # 用 build.buildVersion 单独指定（electron-builder 里这个字段就是
+            # 映射到 Windows 的 FileVersion，注意它在 build 顶层，不在 build.win 里）。
             $fileVer = $ver
             if ($ver -match '^(\d+)\.(\d+)\.(\d+)$') { $fileVer = "$ver.0" }
 
@@ -873,10 +874,10 @@ jobs:
             $new = [regex]::Replace($raw, '("version"\s*:\s*")[^"]*(")', "`${1}$ver`${2}", 1)
             if ($new -eq $raw) { throw "package.json 里没有 version 字段" }
 
-            # 在 build.win 里补 fileVersion，只影响 Windows 版本资源，
-            # 安装包文件名和升级判断仍然走 SemVer。
-            if ($new -match '"win"\s*:\s*\{') {
-              $new = [regex]::Replace($new, '("win"\s*:\s*\{)', "`${1}`r`n      `"fileVersion`": `"$fileVer`",", 1)
+            # 在 build 段补 buildVersion，只影响 Windows 版本资源，
+            # 安装包文件名和升级判断仍然走 SemVer 的 version。
+            if ($new -match '"build"\s*:\s*\{') {
+              $new = [regex]::Replace($new, '("build"\s*:\s*\{)', "`${1}`r`n    `"buildVersion`": `"$fileVer`",", 1)
             }
             [System.IO.File]::WriteAllText($pkgPath, $new, (New-Object System.Text.UTF8Encoding($false)))
             Write-Host "版本号写入 $ver（Windows 文件版本 $fileVer）"
