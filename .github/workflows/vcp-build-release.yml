@@ -66,6 +66,7 @@ jobs:
       backend_sha: ${{ steps.check.outputs.backend_sha }}
       mobile_sha: ${{ steps.check.outputs.mobile_sha }}
       desktop_sha: ${{ steps.check.outputs.desktop_sha }}
+      desktop_recipe: ${{ steps.check.outputs.desktop_recipe }}
       any: ${{ steps.check.outputs.any }}
       last_release_url: ${{ steps.last.outputs.release_url }}
       backend_url: ${{ steps.last.outputs.backend_url }}
@@ -101,6 +102,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
+          # 打包配方版本：只要改了桌面端的打包方式（补丁、版本号写入、打包参数）
+          # 就把这个数加一，让下一次运行即使上游没动也重新打一次包。
+          # v2: 注入数据目录补丁（安装版启动无窗口）+ 写入日期版本号
+          RECIPE_VERSION=v2
 
           # 读取上次记录的提交，没有就当空
           prev() {
@@ -148,11 +154,27 @@ jobs:
             fi
 
             if [ "$cur" = "$old" ]; then
+              # 上游没变，但我们的打包配方可能变了。
+              # 桌面端要注入数据目录补丁、写版本号，这些一旦改动，
+              # 上游虽没动也必须重打，否则发出的还是带老毛病的包。
+              if [ "$name" = "desktop" ]; then
+                old_recipe=$(prev "$name.recipe")
+                cur_recipe="$RECIPE_VERSION"
+                if [ "$old_recipe" != "$cur_recipe" ]; then
+                  echo "$name=build（上游无变化，打包配方 ${old_recipe:-空} → $cur_recipe）"
+                  echo "$name=true" >> "$GITHUB_OUTPUT"
+                  echo "${name}_recipe=$cur_recipe" >> "$GITHUB_OUTPUT"
+                  ANY=true
+                  echo "${name}_sha=$cur" >> "$GITHUB_OUTPUT"
+                  continue
+                fi
+              fi
               echo "$name=skip（无更新，仍是 ${cur:0:8}）"
               echo "$name=false" >> "$GITHUB_OUTPUT"
             else
               echo "$name=build（${old:0:8} → ${cur:0:8}）"
               echo "$name=true" >> "$GITHUB_OUTPUT"
+              echo "${name}_recipe=$RECIPE_VERSION" >> "$GITHUB_OUTPUT"
               ANY=true
             fi
             echo "${name}_sha=$cur" >> "$GITHUB_OUTPUT"
@@ -1211,6 +1233,8 @@ jobs:
           [ "${{ needs.backend.result }}" = "success" ] && echo "${{ needs.detect.outputs.backend_sha }}" > backend.sha || true
           [ "${{ needs.mobile.result }}" = "success" ] && echo "${{ needs.detect.outputs.mobile_sha }}" > mobile.sha || true
           [ "${{ needs.desktop.result }}" = "success" ] && echo "${{ needs.detect.outputs.desktop_sha }}" > desktop.sha || true
+          # 记下这次用的打包配方，下次据此判断「上游没动但打包方式变了」要不要重打
+          [ "${{ needs.desktop.result }}" = "success" ] && echo "${{ needs.detect.outputs.desktop_recipe }}" > desktop.recipe || true
 
           echo "${{ steps.tag.outputs.tag }}" > last-release.txt
           date -u '+%Y-%m-%d %H:%M UTC' > last-built.txt
