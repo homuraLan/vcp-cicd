@@ -307,6 +307,27 @@ if (Test-Path $DeployDir) {
 # ---- 5. 安装 ----
 try {
     if ($setup) {
+        # 装之前先把旧版本清干净。
+        #
+        # 为什么要手动做：NSIS 卸载程序处理不了 electron 的编译残留。
+        # 实测卸载后还留着 better-sqlite3 / electron-edge-js / node-pty 的
+        # MSBuild 中间目录（.tlog / .obj / src 多层嵌套），
+        # 下次安装就会弹 "Failed to uninstall old application files" 并以退出码 2 失败。
+        # 先跑一次卸载器，再把剩下的目录整个删掉，安装才不会卡在这一步。
+        $uninst = Get-ChildItem $DeployDir -Filter "Uninstall*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($uninst) {
+            Log "清理旧版本"
+            try {
+                Start-Process -FilePath $uninst.FullName -ArgumentList "/S", "/currentuser" -Wait -PassThru -ErrorAction Stop | Out-Null
+            } catch {
+                Log "卸载器执行异常（继续）：$($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 2
+            # 卸载器删不掉的部分直接兜底删
+            if (Test-Path $DeployDir) { Remove-Item $DeployDir -Recurse -Force -ErrorAction SilentlyContinue }
+            Start-Sleep -Seconds 1
+        }
+
         Log "静默安装到 $DeployDir"
         # NSIS 的 /D 必须放最后、不加引号，否则会被当成参数的一部分。
         # 不指定的话装到当前身份的 %LOCALAPPDATA%\Programs\vcp-chat-desktop，
@@ -320,6 +341,42 @@ try {
         if (-not (Test-Path $DeployDir)) { New-Item -ItemType Directory -Force -Path $DeployDir | Out-Null }
         Expand-Archive -Path $file -DestinationPath $DeployDir -Force
         Log "解压完成"
+    }
+
+    # ---- 5.5. 修数据目录 + 建快捷方式 ----
+    #
+    # 安装版的致命坑：上游 main.js 里 PROJECT_ROOT = __dirname，
+    # 数据目录默认取 __dirname\AppData。打包后 __dirname 指向 app.asar 内部，
+    # 而 asar 是只读归档，于是启动时 fs.ensureDirSync 直接抛错，
+    # 窗口永远等不到 did-finish-load，表现就是「进程开一堆、界面不出现」。
+    # 上游留了后门：设 VCPCHAT_APP_DATA_DIR 就跳过这个推导（main.js 第 315 行）。
+    # 快捷方式里把环境变量带上，双击才能正常启动。
+    $dataDir = Join-Path $env:APPDATA "vcp-chat-desktop"
+    New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+
+    $appExe = Get-ChildItem $DeployDir -Filter "*.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -notmatch "^Uninstall" } |
+              Sort-Object Length -Descending | Select-Object -First 1
+
+    if ($appExe) {
+        $lnkDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+        New-Item -ItemType Directory -Force -Path $lnkDir | Out-Null
+        $lnkPath = Join-Path $lnkDir "VCP聊天客户端.lnk"
+
+        $ws = New-Object -ComObject WScript.Shell
+        $lnk = $ws.CreateShortcut($lnkPath)
+        $lnk.TargetPath = $appExe.FullName
+        $lnk.WorkingDirectory = $DeployDir
+        $lnk.Description = "VCP 聊天客户端"
+        $lnk.Save()
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($ws)
+
+        # 直接写进用户环境变量，从资源管理器或任何方式启动都能生效
+        [Environment]::SetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", $dataDir, "User")
+        Log "数据目录 $dataDir，快捷方式已创建"
+    }
+    else {
+        Log "警告: 安装目录里没找到主程序，跳过快捷方式"
     }
 
     # 5.1 的 Set-Content -Encoding utf8 会写 BOM，下次读出来带 \ufeff 就比不相等了

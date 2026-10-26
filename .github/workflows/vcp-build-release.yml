@@ -825,7 +825,56 @@ jobs:
         env:
           # 打包完只产出安装包，发布交给后面的 Release 步骤
           EP_DISABLE_PUBLISH: "true"
+          APP_VERSION: ${{ needs.detect.outputs.desktop_version }}
         run: |
+          # 上游 package.json 的 version 恒为 1.0.0，从不更新。
+          # 不改的话装完在「程序和功能」里永远显示 1.0.0，
+          # 看不出装的是哪一版，也没法判断更新有没有生效。
+          $ver = $env:APP_VERSION
+          if ($ver) {
+            $ver = $ver.TrimStart("v")
+            # electron-builder 要求三段式，日期版本补一个 .0
+            if ($ver -match '^\d{4}\.\d{2}\.\d{2}$') { $ver = "$ver.0" }
+            $pkgPath = Join-Path (Get-Location) "package.json"
+            $raw = Get-Content $pkgPath -Raw -Encoding utf8
+            # 只替换顶层 version，不用 ConvertTo-Json 整写，
+            # 否则上游字段顺序和格式全被打乱
+            $new = [regex]::Replace($raw, '("version"\s*:\s*")[^"]*(")', "`${1}$ver`${2}", 1)
+            if ($new -eq $raw) { throw "package.json 里没有 version 字段" }
+            [System.IO.File]::WriteAllText($pkgPath, $new, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "版本号写入 $ver"
+          }
+
+          # ---- 修安装版的数据目录 ----
+          # 上游 main.js 里 PROJECT_ROOT = __dirname，数据目录取 __dirname\AppData。
+          # 打包后 __dirname 指向 app.asar 内部，asar 是只读归档，
+          # 启动时 fs.ensureDirSync 抛错，窗口永远等不到 did-finish-load。
+          # 现象是进程起一堆、界面死活不出现，而日志里只有一句含糊的
+          # UnhandledPromiseRejectionWarning，很难查。
+          # 这里改成打包后用用户数据目录，源码直接跑不受影响。
+          $mainJs = Join-Path (Get-Location) "main.js"
+          if (Test-Path $mainJs) {
+            $mj = Get-Content $mainJs -Raw -Encoding utf8
+            if ($mj.Contains("const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot")) {
+              # 已经有这段，替换成打包感知的版本
+              $mj = [regex]::Replace(
+                $mj,
+                "const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot\r?\n\s*\? path\.resolve\(isolatedAppDataRoot\)\r?\n\s*: path\.join\(PROJECT_ROOT, 'AppData'\);",
+                "const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot`r`n    ? path.resolve(isolatedAppDataRoot)`r`n    : (app.isPackaged ? app.getPath('userData') : path.join(PROJECT_ROOT, 'AppData'));"
+              )
+              [System.IO.File]::WriteAllText($mainJs, $mj, (New-Object System.Text.UTF8Encoding($false)))
+              Write-Host "已修安装版数据目录: 打包后用 userData"
+            }
+            else {
+              # 打不上就别发了 —— 带这个病的安装包装出来是打不开的，
+              # 与其发个能装不能跑的包，不如在构建阶段就失败
+              throw "main.js 里没找到 APP_DATA_ROOT_IN_PROJECT 定义，安装版会打不开"
+            }
+          }
+          else {
+            throw "src/main.js 不存在，打包目录不对"
+          }
+
           npm run build
           if ($LASTEXITCODE -ne 0) { throw "构建失败" }
 

@@ -7,6 +7,7 @@
 param(
     [string]$Sha = "",
     [string]$Work = "",
+    [string]$Version = "",
     [switch]$Force
 )
 
@@ -114,6 +115,26 @@ try {
     Log "构建 Rust 运行时组件"
     & npm run build 2>&1 | Tee-Object -FilePath $Log -Append
     if ($LASTEXITCODE -ne 0) { throw "Rust 运行时构建失败" }
+
+    # ---- 写入版本号 ----
+    # 上游 package.json 的 version 恒为 1.0.0，从不更新。
+    # 不改的话安装后注册表里的「程序和功能」会一直显示 1.0.0，
+    # 装完看不出是哪个版本，也就没法判断更新到底有没有生效。
+    if ($Version) {
+        $ver = $Version.TrimStart("v")
+        # electron-builder 要求 x.y.z 三段式，日期版本要补成 2026.10.26.0 这种
+        if ($ver -match '^\d{4}\.\d{2}\.\d{2}$') { $ver = "$ver.0" }
+
+        $pkgPath = Join-Path $Src "package.json"
+        $raw = Get-Content $pkgPath -Raw -Encoding utf8
+        # 只替换顶层 version 那一行，别用 ConvertTo-Json 整个重写 ——
+        # 那会把上游的字段顺序和格式全打乱，之后 diff 全是噪声。
+        $newRaw = [regex]::Replace($raw, '("version"\s*:\s*")[^"]*(")', "`${1}$ver`${2}", 1)
+        if ($newRaw -eq $raw) { throw "package.json 里没有找到 version 字段" }
+        # 上游文件可能带 BOM，按无 BOM 写回避免 JSON.parse 报错
+        [System.IO.File]::WriteAllText($pkgPath, $newRaw, (New-Object System.Text.UTF8Encoding($false)))
+        Log "版本号写入 $ver"
+    }
 
     # ---- 打包 Electron ----
     Log "electron-builder 打包"
