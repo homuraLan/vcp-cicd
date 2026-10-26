@@ -450,6 +450,9 @@ jobs:
           DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           UPSTREAM_SHA: ${{ steps.meta.outputs.sha }}
+          UPSTREAM_VERSION: ${{ needs.detect.outputs.backend_version }}
+          # release job 依赖本 job，这里取不到它的输出，用完整 SHA 拼发布页地址
+          REPO: ${{ github.repository }}
         run: |
           if [ -z "$DH_TOKEN" ]; then
             echo "未配置凭证，跳过"
