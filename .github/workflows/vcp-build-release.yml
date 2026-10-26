@@ -239,24 +239,34 @@ jobs:
           echo "mobile_version=$MB" >> "$GITHUB_OUTPUT"
           echo "desktop_version=$DE" >> "$GITHUB_OUTPUT"
 
-          # 一版发布里可能同时更新多个组件，那就把各自版本都写上
+          # 一版发布里可能同时更新多个组件，各自版本互不相同。
+          # 只取一个组件的版本号会让另两个对不上（比如只更新了移动端，
+          # 标签却是服务端的旧版本），所以把本次构建到的组件版本都带上。
           PARTS=""
-          [ -n "$BE" ] && PARTS="${PARTS}server-${BE#v}."
-          [ -n "$MB" ] && PARTS="${PARTS}app-${MB#v}."
-          [ -n "$DE" ] && PARTS="${PARTS}desktop-${DE#v}."
-          PARTS=${PARTS%.}
+          if [ "${{ steps.check.outputs.backend }}" = "true" ] && [ -n "$BE" ]; then
+            PARTS="${PARTS}.${BE#v}"
+          fi
+          if [ "${{ steps.check.outputs.mobile }}" = "true" ] && [ -n "$MB" ]; then
+            PARTS="${PARTS}.${MB#v}"
+          fi
+          if [ "${{ steps.check.outputs.desktop }}" = "true" ] && [ -n "$DE" ]; then
+            PARTS="${PARTS}.${DE#v}"
+          fi
 
+          # 全部跳过时（理论上不会走到发布）退回服务端版本
           if [ -z "$PARTS" ]; then
-            echo "::warning::上游都没有可用版本号"
-            echo "release_version=" >> "$GITHUB_OUTPUT"
+            RV="${BE#v}"
+            [ -z "$RV" ] && RV="${MB#v}"
+            [ -z "$RV" ] && RV="${DE#v}"
+            echo "release_version=${RV}" >> "$GITHUB_OUTPUT"
           else
-            echo "release_version=$PARTS" >> "$GITHUB_OUTPUT"
+            echo "release_version=${PARTS#.}" >> "$GITHUB_OUTPUT"
           fi
 
           echo "服务端版本: ${BE:-未知}"
           echo "移动端版本: ${MB:-未知}"
           echo "桌面端版本: ${DE:-未知}"
-          echo "组合版本: ${PARTS:-空}"
+          echo "发布版本: ${PARTS#.}"
 
   # ============ 1. 服务端 ============
   backend:
