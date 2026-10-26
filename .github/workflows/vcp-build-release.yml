@@ -261,13 +261,28 @@ jobs:
               | python3 -c "import sys,json; d=json.load(sys.stdin); v=str(d.get('version','')).strip(); print('v'+v if v and v!='0.0.0' else '')"
           }
 
+          # 既没 tag 又没有像样的 package.json 版本时，用提交日期当版本号。
+          # 日期取的是「这次真正要构建的那个提交」的日期，不是仓库最新提交，
+          # 否则手动指定 SHA 时会拿到对不上的日子。
+          date_version() {
+            local repo="$1" sha="$2"
+            if [ -z "$sha" ]; then echo ""; return; fi
+            curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$repo/commits/$sha" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); c=d.get('commit',{}); dt=c.get('committer',{}).get('date') or c.get('author',{}).get('date') or ''; print('v'+dt[:10].replace('-','.') if len(dt)>=10 else '')" 2>/dev/null || echo ""
+          }
+
           BE=$(latest_tag lioensky/VCPToolBox)
           [ -z "$BE" ] && BE=$(pkg_version lioensky/VCPToolBox)
 
           MB=$(latest_tag MRiecy/VCPMobile)
           [ -z "$MB" ] && MB=$(pkg_version MRiecy/VCPMobile)
 
+          # VCPChat 没有版本 tag，package.json 恒为 1.0.0，这个数字不代表任何东西。
+          # 直接按提交日期走，至少每次更新都能区分开。
           DE=$(latest_tag lioensky/VCPChat)
+          [ -z "$DE" ] && DE=$(date_version lioensky/VCPChat "${{ steps.check.outputs.desktop_sha }}")
           [ -z "$DE" ] && DE=$(pkg_version lioensky/VCPChat)
 
           echo "backend_version=$BE" >> "$GITHUB_OUTPUT"
@@ -814,13 +829,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path out | Out-Null
 
           $short = "${{ steps.meta.outputs.short }}"
-          $date = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
 
-          # 版本号从上游 package.json 读，缺失时有兜底
-          $ver = "unknown"
-          if (Test-Path "src/package.json") {
-            try { $ver = (Get-Content "src/package.json" -Raw | ConvertFrom-Json).version } catch {}
-          }
+          # 版本号取 detect 算好的那个（上游 tag 优先，没有就用提交日期）。
+          # 不要再读 src/package.json：VCPChat 那里写死 1.0.0，跟实际更新无关。
+          $ver = "${{ needs.detect.outputs.desktop_version }}".TrimStart('v')
+          if (-not $ver) { $ver = $short }
 
           # 收集全部二进制成品：安装包、增量更新块、绿色版压缩包
           $exts = @('.exe', '.msi', '.msix', '.appx', '.7z', '.zip', '.blockmap', '.yml')

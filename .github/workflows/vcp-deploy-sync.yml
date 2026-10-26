@@ -11,9 +11,9 @@ name: VCP 部署对齐
 #   - 也可以手动触发
 #
 # 更新频率：上游照常编译，这里控制的是本机多久去拉一次。
-# 每一端有自己的间隔，配在仓库变量里，改完下个整点生效：
-#   VCP_SERVER_INTERVAL_H   服务端，默认 6（小时，0 = 不自动拉）
-#   VCP_CHAT_INTERVAL_H     桌面端，默认 6
+# 默认一周一次，每一端可以单独改，配在仓库变量里，改完下个整点生效：
+#   VCP_SERVER_INTERVAL_H   服务端，默认 168（小时 = 一周，0 = 不自动拉）
+#   VCP_CHAT_INTERVAL_H     桌面端，默认 168
 # 没到间隔的端直接跳过，不会去查也不会去拉。
 #
 # 幂等：目标版本已在跑就直接退出，不会无谓重启服务。
@@ -134,7 +134,7 @@ jobs:
           TARGET_TAG: ${{ needs.check.outputs.backend_tag }}
           HEALTH_URL: ${{ vars.VCP_SERVER_URL }}
           # 本机多久拉一次，0 = 不自动拉；手动触发时无视间隔
-          INTERVAL_H: ${{ vars.VCP_SERVER_INTERVAL_H || '6' }}
+          INTERVAL_H: ${{ vars.VCP_SERVER_INTERVAL_H || '168' }}
           FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: |
           if [ -z "${DEPLOY_DIR:-}" ]; then
@@ -183,7 +183,7 @@ jobs:
           # 用桌面端自己的那一版，不能用 tag：那一版可能只有服务端
           TAG: ${{ needs.check.outputs.desktop_tag }}
           REPO: ${{ github.repository }}
-          INTERVAL_H: ${{ vars.VCP_CHAT_INTERVAL_H || '6' }}
+          INTERVAL_H: ${{ vars.VCP_CHAT_INTERVAL_H || '168' }}
           FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: |
           if (-not $env:CHAT_DIR) {
@@ -196,7 +196,7 @@ jobs:
           }
           $ErrorActionPreference = 'Stop'
           try {
-            $hours = 6
+            $hours = 168
             if ($env:INTERVAL_H) { [int]::TryParse($env:INTERVAL_H, [ref]$hours) | Out-Null }
             $force = ($env:FORCE -eq '1')
             & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo $env:REPO -IntervalHours $hours -Force:$force

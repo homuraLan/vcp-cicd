@@ -12,14 +12,14 @@
 #   -Tag          目标发布标签，如 v2026.10.25-13
 #   -DeployDir    安装目录（默认取仓库变量）
 #   -Repo         仓库全名
-#   -IntervalHours 本机多久拉一次，0 表示不自动拉（默认 6）
+#   -IntervalHours 本机多久拉一次，0 表示不自动拉（默认 168 = 一周）
 #   -Force        忽略间隔，立刻拉
 
 param(
     [Parameter(Mandatory = $true)][string]$Tag,
     [string]$DeployDir = "",
     [string]$Repo = "homuraLan/vcp-cicd",
-    [int]$IntervalHours = 6,
+    [int]$IntervalHours = 168,
     [switch]$Force
 )
 

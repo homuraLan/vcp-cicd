@@ -41,6 +41,7 @@
 | `vcptoolbox-<版本>-<hash>-linux-amd64.tar.gz` | Linux | 服务端二进制，解压即跑 |
 
 文件名里的 `<hash>` 是上游提交的短 SHA，能直接对上源码版本。
+桌面端的 `<版本>` 是上游提交日期，如 `VCPChat-Setup-2026.10.25-74d4a491.exe`。
 
 每个文件都配了同名的 `.sha256`，另有一份汇总的 `SHA256SUMS`：
 
@@ -161,28 +162,32 @@ docker pull homuralan/vcptoolbox:latest
 **上游构建** —— 有新提交就编译，每 6 小时查一次上游。这一层不设频率限制，
 上游动了就构建，保证 Release 里永远是最新代码。
 
-**本机拉取** —— 已部署的机器多久去取一次新版本，每一端单独设：
+**本机拉取** —— 已部署的机器多久去取一次新版本，默认一周一次，每一端单独设：
 
 | 仓库变量 | 管什么 | 默认 |
 | :--- | :--- | :--- |
-| `VCP_SERVER_INTERVAL_H` | 服务端多久拉一次 | `6`（小时） |
-| `VCP_CHAT_INTERVAL_H` | 桌面端多久拉一次 | `6`（小时） |
+| `VCP_SERVER_INTERVAL_H` | 服务端多久拉一次 | `168`（小时 = 一周） |
+| `VCP_CHAT_INTERVAL_H` | 桌面端多久拉一次 | `168`（小时 = 一周） |
 
 移动端没有这一项：APK 只是放在局域网下载页上，手机上什么时候装由你决定，
 不存在「自动拉取」这一步。
 
-改法：
+改法（小时数）：
 
 ```bash
-gh variable set VCP_SERVER_INTERVAL_H --repo homuraLan/vcp-cicd --body "24"
+gh variable set VCP_SERVER_INTERVAL_H --repo homuraLan/vcp-cicd --body "24"     # 一天
+gh variable set VCP_CHAT_INTERVAL_H --repo homuraLan/vcp-cicd --body "72"       # 三天
 ```
 
 填 `0` 表示该端不自动拉，只能手动触发。手动触发 `VCP 部署对齐` workflow
 会忽略间隔立刻对齐一次，升级完想马上验证时用这个。
 
-版本号直接沿用上游仓库的最新 tag，跟上游对得上：服务端是 `v1.13.0` 这种，
-移动端是 `v1.1.6`。同一上游版本重复构建时追加 `.N`（如 `v1.13.0.2`）保证唯一。
-一版里同时更新了多个组件时，标签会带上各自版本，如 `v1.13.0.1.1.6`。
+版本号沿用上游仓库的最新 tag：服务端是 `v1.13.0` 这种，移动端是 `v1.1.6`。
+
+桌面端例外：VCPChat 上游没有版本 tag，`package.json` 里写死的 `1.0.0` 从来不更新，
+所以用它最新提交的日期当版本号，如 `v2026.10.25`。
+
+一版里同时更新了多个组件时，标签会带上各自版本，如 `v1.13.0.1.1.6.2026.10.25`。
 
 </details>
 

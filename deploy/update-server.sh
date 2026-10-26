@@ -16,7 +16,7 @@
 #   TARGET_SHA     目标上游提交（可选，用于记录）
 #   TARGET_TAG     目标发布标签（可选，用于算拉取间隔）
 #   HEALTH_URL     健康检查地址（可选）
-#   INTERVAL_H     本机多久拉一次，小时；0 表示不自动拉（可选，默认 6）
+#   INTERVAL_H     本机多久拉一次，小时；0 表示不自动拉（可选，默认 168 = 一周）
 #   FORCE          设为 1 忽略间隔，立刻拉（手动触发时用）
 
 set -euo pipefail
@@ -26,7 +26,7 @@ TARGET_IMAGE="${TARGET_IMAGE:?必须指定 TARGET_IMAGE}"
 TARGET_SHA="${TARGET_SHA:-}"
 TARGET_TAG="${TARGET_TAG:-}"
 HEALTH_URL="${HEALTH_URL:-}"
-INTERVAL_H="${INTERVAL_H:-6}"
+INTERVAL_H="${INTERVAL_H:-168}"
 FORCE="${FORCE:-0}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
