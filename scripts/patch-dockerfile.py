@@ -31,17 +31,22 @@ RUN echo ">>> Building plugin native binaries..." && \\
     ; do \\
       src="${spec%%:*}"; \\
       out="${spec#*:}"; \\
+      # target/release 下的文件名是 crate 名，即插件名去掉平台后缀
+      bin=$(basename "$out" | cut -d- -f1); \\
       if [ ! -f "Plugin/$src/Cargo.toml" ]; then \\
         echo "skip $src (no Cargo.toml)"; \\
         continue; \\
       fi; \\
       echo "--- building $src -> $out"; \\
       ( cd "Plugin/$src" && cargo build --release ) || { echo "!!! failed: $src"; exit 1; }; \\
+      if [ ! -f "Plugin/$src/target/release/$bin" ]; then \\
+        echo "!!! 编译没有产出 $bin"; \\
+        exit 1; \\
+      fi; \\
       mkdir -p "$(dirname "Plugin/$out")"; \\
-      cp "Plugin/$src/target/release/$(basename "$out")" "Plugin/$out" 2>/dev/null || \\
-        cp "Plugin/$src/target/release/$(basename "$src")" "Plugin/$out"; \\
+      cp "Plugin/$src/target/release/$bin" "Plugin/$out" || { echo "!!! 复制失败"; exit 1; }; \\
       chmod +x "Plugin/$out"; \\
-      echo "    -> $(stat -c %s "Plugin/$out") bytes"; \\
+      echo "    -> $(wc -c < "Plugin/$out") bytes"; \\
     done && \\
     echo ">>> plugin native build complete."
 # <<< plugin-native-build
