@@ -847,23 +847,29 @@ jobs:
 
           # ---- 修安装版的数据目录 ----
           # 上游 main.js 里 PROJECT_ROOT = __dirname，数据目录取 __dirname\AppData。
-          # 打包后 __dirname 指向 app.asar 内部，asar 是只读归档，
-          # 启动时 fs.ensureDirSync 抛错，窗口永远等不到 did-finish-load。
-          # 现象是进程起一堆、界面死活不出现，而日志里只有一句含糊的
-          # UnhandledPromiseRejectionWarning，很难查。
-          # 这里改成打包后用用户数据目录，源码直接跑不受影响。
+          # 源码直接跑时这是项目目录，可写；但打包后 __dirname 指向 app.asar 内部，
+          # asar 是只读归档，启动时 fs.ensureDirSync 直接抛错，
+          # 窗口永远等不到 did-finish-load，现象是进程起一堆、界面死活不出现。
+          #
+          # 官方自己的处理方式（apps/bootstrap-installer/src-tauri/src/lib.rs 第 950 行）
+          # 给启动器注入 VCPCHAT_APP_DATA_DIR = <项目根>\AppData，
+          # 并且明确说明这是为了避免多份 Electron 共用默认 userData 产生单实例冲突
+          # （docs/vcpchat-tauri-installer-development-plan.md 第 229 行）。
+          # 所以这里跟着官方走：数据放「程序目录\AppData」，不要改成 userData。
+          #
+          # 装到哪儿由部署脚本的 /D 决定，这里只保证「数据永远跟着程序走」。
+          # 实测 process.execPath 就是安装目录里的主程序路径，dirname 即安装目录。
           $mainJs = Join-Path (Get-Location) "main.js"
           if (Test-Path $mainJs) {
             $mj = Get-Content $mainJs -Raw -Encoding utf8
             if ($mj.Contains("const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot")) {
-              # 已经有这段，替换成打包感知的版本
               $mj = [regex]::Replace(
                 $mj,
                 "const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot\r?\n\s*\? path\.resolve\(isolatedAppDataRoot\)\r?\n\s*: path\.join\(PROJECT_ROOT, 'AppData'\);",
-                "const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot`r`n    ? path.resolve(isolatedAppDataRoot)`r`n    : (app.isPackaged ? app.getPath('userData') : path.join(PROJECT_ROOT, 'AppData'));"
+                "const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot`r`n    ? path.resolve(isolatedAppDataRoot)`r`n    : path.join(app.isPackaged ? path.dirname(app.getPath('exe')) : PROJECT_ROOT, 'AppData');"
               )
               [System.IO.File]::WriteAllText($mainJs, $mj, (New-Object System.Text.UTF8Encoding($false)))
-              Write-Host "已修安装版数据目录: 打包后用 userData"
+              Write-Host "已修安装版数据目录: 打包后用程序目录\AppData"
             }
             else {
               # 打不上就别发了 —— 带这个病的安装包装出来是打不开的，
