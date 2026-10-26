@@ -318,11 +318,19 @@ jobs:
             fi
           done
 
+          # 上游 Dockerfile 只编译了 rust-vexus-lite，插件里的 Rust 子项目靠仓库里
+          # 的预编译二进制，缺 x86_64-linux 版本的插件跑不起来。补上编译段。
+          python3 ../ci/scripts/patch-dockerfile.py Dockerfile
+
       - name: 构建镜像
         id: build
         run: |
           cd src
-          docker build -t "vcptoolbox:build" . 2>&1 | tail -30
+          # 构建失败要看到真正的错误，别被 tail 截掉尾部之外的信息
+          if ! docker build -t "vcptoolbox:build" . ; then
+            echo "::error::镜像构建失败"
+            exit 1
+          fi
           # 多标签：
           #   <短hash>   精确对应一次上游提交，回滚用
           #   <日期>     按天滚动，便于按时间找
@@ -1106,11 +1114,16 @@ jobs:
         shell: bash
         env:
           DEPLOY_DIR: ${{ vars.VCP_SERVER_DIR }}
-          TARGET_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox:${{ needs.detect.outputs.backend_sha }}
+          # 镜像 tag 用短 hash：推送时打的是 8 位，这里传完整 SHA 会拉不到。
+          FULL_SHA: ${{ needs.detect.outputs.backend_sha }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           TARGET_SHA: ${{ needs.detect.outputs.backend_sha }}
           HEALTH_URL: ${{ vars.VCP_SERVER_URL }}
         run: |
           chmod +x ci/deploy/update-server.sh
+          # 镜像只按短 hash 打标，拉取必须用同一个名字
+          export TARGET_IMAGE="${DH_USER}/vcptoolbox:${FULL_SHA:0:8}"
+          echo "目标镜像: $TARGET_IMAGE"
           bash ci/deploy/update-server.sh
 
   deploy-chat:
