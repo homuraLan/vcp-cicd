@@ -29,6 +29,113 @@ function Log($msg) {
     Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg"
 }
 
+# 分片并行下载。
+#
+# 为什么要自己写：GitHub 对单条连接有明显限速，实测单流只有 0.5 MB/s 左右，
+# 四百多兆的安装包要下十六分钟。开八条连接并行能到 4 MB/s 以上，
+# 同样的文件两分钟以内就完了。gh 的 download 子命令不会自己并行。
+#
+# 关键点：
+#   - 先 HEAD 拿长度，再按 Range 切块，每块独立请求
+#   - 每块失败重试几次，避免一个连接抖动就整包重来
+#   - 下完必须核对总长度，短了就是没下全，直接报错
+function Get-FileParallel {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [int]$Parts = 8,
+        [int]$Retries = 3
+    )
+
+    $head = [System.Net.HttpWebRequest]::Create($Uri)
+    $head.Method = "HEAD"
+    $head.Timeout = 30000
+    $head.AllowAutoRedirect = $true
+    if ($env:GH_TOKEN) { $head.Headers.Add("Authorization", "Bearer $($env:GH_TOKEN)") }
+    $hr = $head.GetResponse()
+    $size = [int64]$hr.ContentLength
+    $ranges = $hr.Headers["Accept-Ranges"]
+    $hr.Close()
+
+    if ($size -le 0) { throw "拿不到文件大小" }
+    $mb = [math]::Round($size / 1MB, 1)
+
+    # 服务器不支持分片就只能老实用单流
+    if ($ranges -ne "bytes" -or $size -lt 8MB) {
+        Log "服务器不支持分片，改用单流下载（$mb MB）"
+        $single = [System.Net.HttpWebRequest]::Create($Uri)
+        $single.Timeout = 60000
+        if ($env:GH_TOKEN) { $single.Headers.Add("Authorization", "Bearer $($env:GH_TOKEN)") }
+        $sr = $single.GetResponse()
+        $sr.GetResponseStream().CopyTo([System.IO.File]::Create($OutFile))
+        $sr.Close()
+        return
+    }
+
+    Log "分片下载 $mb MB，$Parts 路并行"
+
+    $chunk = [int64][math]::Ceiling($size / $Parts)
+    $tasks = @()
+    for ($i = 0; $i -lt $Parts; $i++) {
+        $from = $i * $chunk
+        $to = [math]::Min($from + $chunk - 1, $size - 1)
+        if ($from -ge $size) { break }
+        $slice = Join-Path ([System.IO.Path]::GetDirectoryName($OutFile)) ("part{0}.tmp" -f $i)
+
+        $tasks += Start-Job -ScriptBlock {
+            param($u, $a, $b, $dest, $tries, $tok)
+            $err = $null
+            for ($k = 1; $k -le $tries; $k++) {
+                try {
+                    $req = [System.Net.HttpWebRequest]::Create($u)
+                    $req.Timeout = 60000
+                    $req.ReadWriteTimeout = 60000
+                    $req.AddRange($a, $b)
+                    if ($tok) { $req.Headers.Add("Authorization", "Bearer $tok") }
+                    $resp = $req.GetResponse()
+                    $in = $resp.GetResponseStream()
+                    $out = [System.IO.File]::Create($dest)
+                    $buf = New-Object byte[] 131072
+                    while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
+                        $out.Write($buf, 0, $n)
+                    }
+                    $out.Close(); $in.Close(); $resp.Close()
+                    $want = $b - $a + 1
+                    $got = (Get-Item $dest).Length
+                    if ($got -ne $want) { throw "分片长度不对: 期望 $want 实际 $got" }
+                    return "ok"
+                } catch {
+                    $err = $_.Exception.Message
+                    Start-Sleep -Seconds 2
+                }
+            }
+            return "fail: $err"
+        } -ArgumentList $Uri, $from, $to, $slice, $Retries, $env:GH_TOKEN
+    }
+
+    $null = $tasks | Wait-Job
+    $results = $tasks | Receive-Job
+    $tasks | Remove-Job -Force
+
+    $bad = $results | Where-Object { $_ -ne "ok" }
+    if ($bad) { throw "分片下载失败: $($bad -join '; ')" }
+
+    # 按顺序拼回一个文件
+    $out = [System.IO.File]::Create($OutFile)
+    for ($i = 0; $i -lt $tasks.Count; $i++) {
+        $slice = Join-Path ([System.IO.Path]::GetDirectoryName($OutFile)) ("part{0}.tmp" -f $i)
+        $bytes = [System.IO.File]::ReadAllBytes($slice)
+        $out.Write($bytes, 0, $bytes.Length)
+        Remove-Item $slice -Force
+    }
+    $out.Close()
+
+    $finalSize = (Get-Item $OutFile).Length
+    if ($finalSize -ne $size) {
+        throw "拼接后大小不对: 期望 $size 实际 $finalSize"
+    }
+}
+
 if (-not $DeployDir) {
     $DeployDir = $env:VCP_CHAT_DIR
     if (-not $DeployDir) {
@@ -96,20 +203,51 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 # ---- 3. 下载并校验 ----
 $target = if ($setup) { $setup } else { $portable }
 Log "下载 $target"
-# 这个包有四百多兆，服务账户走代理时慢得离谱。
-# gh 默认不打印进度，20 分钟超时前日志里只有一个「下载 xxx」，
-# 看不出卡在哪。所以把 gh 自己的输出实时透出来，慢也看得见进度。
-$env:GH_PROGRESS = "1"
-& gh release download $Tag --repo $Repo --pattern $target --dir $tmp
-if ($LASTEXITCODE -ne 0) {
-    Log "下载失败"
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    exit 1
-}
 
-$file = Join-Path $tmp $target
-$sizeMB = [math]::Round((Get-Item $file).Length / 1MB, 1)
-Log "已下载 $sizeMB MB"
+# GitHub 对单连接限速，gh 的 download 只能单流，四百多兆要下十几分钟。
+# 这里改成拿 asset 直链，自己分片并行下载。
+# Accept: octet-stream 才会重定向到真实文件地址，默认返回的是 JSON。
+try {
+    $url = & gh api "repos/$Repo/releases/tags/$Tag" `
+        --jq ".assets[] | select(.name == `"$target`") | .url" 2>&1
+    if (-not $url -or $url -match '^(gh:|warning)') { throw "没有找到资产 $target" }
+    $url = ($url | Select-Object -First 1).Trim()
+
+    $file = Join-Path $tmp $target
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # asset.url 是 API 地址，加 octet-stream 头才会跳转到文件本体
+    $req = [System.Net.HttpWebRequest]::Create($url)
+    $req.Method = "GET"
+    $req.AllowAutoRedirect = $false
+    $req.Headers.Add("Authorization", "Bearer $($env:GH_TOKEN)")
+    $req.Accept = "application/octet-stream"
+    try { $resp = $req.GetResponse() } catch { $resp = $null }
+    $realUri = $url
+    if ($resp) {
+        if ([int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
+            $realUri = $resp.Headers["Location"]
+        }
+        $resp.Close()
+    }
+    if (-not $realUri -or $realUri -eq $url) { throw "拿不到文件直链" }
+
+    Get-FileParallel -Uri $realUri -OutFile $file -Parts 8
+    $sw.Stop()
+    $mb = [math]::Round((Get-Item $file).Length / 1MB, 1)
+    $rate = [math]::Round($mb / [math]::Max($sw.Elapsed.TotalSeconds, 0.001), 2)
+    Log "已下载 $mb MB，用时 $([math]::Round($sw.Elapsed.TotalSeconds,1)) 秒（$rate MB/s）"
+} catch {
+    Log "并行下载失败（$($_.Exception.Message)），退回单流"
+    & gh release download $Tag --repo $Repo --pattern $target --dir $tmp
+    if ($LASTEXITCODE -ne 0) {
+        Log "下载失败"
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        exit 1
+    }
+    $file = Join-Path $tmp $target
+    Log "已下载 $([math]::Round((Get-Item $file).Length / 1MB, 1)) MB"
+}
 
 # 有校验值就核对
 $sumName = "$target.sha256"
