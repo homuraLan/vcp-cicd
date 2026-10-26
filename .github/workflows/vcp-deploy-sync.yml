@@ -74,8 +74,10 @@ jobs:
           while IFS= read -r name; do
             case "$name" in
               vcptoolbox-*-linux-amd64.tar.gz)
-                # vcptoolbox-20261025-add5dbb5-linux-amd64.tar.gz
-                BACKEND_SHA=$(echo "$name" | sed -E 's/^vcptoolbox-[0-9]+-([0-9a-f]+)-linux-amd64\.tar\.gz$/\1/')
+                # 新格式 vcptoolbox-1.13.0-add5dbb5-linux-amd64.tar.gz
+                # 老格式 vcptoolbox-20261025-add5dbb5-linux-amd64.tar.gz
+                # 两种都取最后那段 hash，兼容已发布的历史版本
+                BACKEND_SHA=$(echo "$name" | sed -E 's/^vcptoolbox-.*-([0-9a-f]{7,40})-linux-amd64\.tar\.gz$/\1/')
                 HAS_BACKEND=true
                 ;;
               *Setup*.exe) HAS_DESKTOP=true ;;

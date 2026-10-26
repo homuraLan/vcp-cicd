@@ -59,6 +59,10 @@ jobs:
       desktop_sha: ${{ steps.check.outputs.desktop_sha }}
       any: ${{ steps.check.outputs.any }}
       last_release_url: ${{ steps.last.outputs.release_url }}
+      backend_version: ${{ steps.ver.outputs.backend_version }}
+      mobile_version: ${{ steps.ver.outputs.mobile_version }}
+      desktop_version: ${{ steps.ver.outputs.desktop_version }}
+      release_version: ${{ steps.ver.outputs.release_version }}
 
     steps:
       # state 分支可能还不存在，所以不用 checkout action，
@@ -194,6 +198,66 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # 版本号跟随上游，不自造
+      # 上游 VCPToolBox / VCPMobile 都用语义化 tag（v1.13.0 / v1.1.6），
+      # 所以发布版本直接用上游 tag，而不是日期 + run number。
+      # VCPChat 没有版本 tag，退回上游 package.json 的 version。
+      - name: 读取上游版本
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 取仓库最新 tag，没有就空。
+          # python 必须写成单行：多行代码会从第 0 列开始，破坏 run 块缩进。
+          latest_tag() {
+            curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$1/tags?per_page=30" \
+              | python3 -c "import sys,json,re; d=json.load(sys.stdin); vs=[(tuple(int(x) for x in m.groups()),'v%d.%d.%d'%tuple(int(x) for x in m.groups())) for t in (d if isinstance(d,list) else []) for m in [re.match(r'^[vV]?([0-9]+)\.([0-9]+)\.([0-9]+)\$', str(t.get('name','')))] if m]; print(max(vs)[1] if vs else '')"
+          }
+
+          # 仓库没有 tag 时读 package.json 的 version
+          pkg_version() {
+            curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/$1/contents/package.json" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); v=str(d.get('version','')).strip(); print('v'+v if v and v!='0.0.0' else '')"
+          }
+
+          BE=$(latest_tag lioensky/VCPToolBox)
+          [ -z "$BE" ] && BE=$(pkg_version lioensky/VCPToolBox)
+
+          MB=$(latest_tag MRiecy/VCPMobile)
+          [ -z "$MB" ] && MB=$(pkg_version MRiecy/VCPMobile)
+
+          DE=$(latest_tag lioensky/VCPChat)
+          [ -z "$DE" ] && DE=$(pkg_version lioensky/VCPChat)
+
+          echo "backend_version=$BE" >> "$GITHUB_OUTPUT"
+          echo "mobile_version=$MB" >> "$GITHUB_OUTPUT"
+          echo "desktop_version=$DE" >> "$GITHUB_OUTPUT"
+
+          # 一版发布里可能同时更新多个组件，那就把各自版本都写上
+          PARTS=""
+          [ -n "$BE" ] && PARTS="${PARTS}server-${BE#v}."
+          [ -n "$MB" ] && PARTS="${PARTS}app-${MB#v}."
+          [ -n "$DE" ] && PARTS="${PARTS}desktop-${DE#v}."
+          PARTS=${PARTS%.}
+
+          if [ -z "$PARTS" ]; then
+            echo "::warning::上游都没有可用版本号"
+            echo "release_version=" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_version=$PARTS" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "服务端版本: ${BE:-未知}"
+          echo "移动端版本: ${MB:-未知}"
+          echo "桌面端版本: ${DE:-未知}"
+          echo "组合版本: ${PARTS:-空}"
+
   # ============ 1. 服务端 ============
   backend:
     name: 构建 VCPToolBox
@@ -224,6 +288,10 @@ jobs:
           SHORT=${SHA:0:8}
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          # 上游语义化版本，由 detect 统一查好传下来，产物名和 Release 都对齐它
+          VER="${{ needs.detect.outputs.backend_version }}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "上游版本: ${VER:-未知}"
           echo "服务端提交: $SHA"
 
       - name: 准备构建上下文
@@ -296,7 +364,15 @@ jobs:
           SHORT="${{ steps.meta.outputs.short }}"
           SHA="${{ steps.meta.outputs.sha }}"
           DATE=$(date -u '+%Y%m%d')
-          NAME="vcptoolbox-${DATE}-${SHORT}-linux-amd64"
+          # 版本号在前、commit 在后：同名版本的不同构建靠 hash 区分，
+          # 跟 GitHub 上常见的 <name>-<version>-<platform>.<ext> 一致
+          VER="${{ steps.meta.outputs.version }}"
+          VER=${VER#v}
+          if [ -n "$VER" ]; then
+            NAME="vcptoolbox-${VER}-${SHORT}-linux-amd64"
+          else
+            NAME="vcptoolbox-${DATE}-${SHORT}-linux-amd64"
+          fi
           IMAGE_TAG="${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox:${SHORT}"
           mkdir -p pkg
 
@@ -748,9 +824,33 @@ jobs:
     steps:
       - name: 生成版本标签
         id: tag
+        env:
+          VERSION: ${{ needs.detect.outputs.release_version }}
         run: |
-          # 用日期 + 运行号，保证唯一且可排序
-          TAG="v$(date -u '+%Y.%m.%d')-${GITHUB_RUN_NUMBER}"
+          # 标签直接沿用上游版本（如 v1.13.0），跟上游 tag 对得上，用户一眼能看出
+          # 这版对应上游哪个版本。同一上游版本重复构建时追加 .N 递增，保证不冲突。
+          BASE="v${VERSION}"
+          if [ -z "$VERSION" ]; then
+            # 上游一个版本号都取不到时才退回日期，正常不该走到这
+            BASE="v$(date -u '+%Y.%m.%d')"
+            echo "::warning::上游没有可用版本号，改用日期 $BASE"
+          fi
+
+          TAG="$BASE"
+          n=1
+          # 已存在同名 tag 就追加 .N 递增。用 API 查，这个 job 没有 checkout，
+          # 依赖本地 git 会失败。
+          tag_exists() {
+            curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/git/ref/tags/$1" | grep -q '^200$'
+          }
+          while tag_exists "$TAG"; do
+            n=$((n + 1))
+            TAG="${BASE}.${n}"
+          done
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "本次标签: $TAG"
 
@@ -838,11 +938,13 @@ jobs:
             echo ""
             echo "构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
             echo ""
-            echo "| 组件 | 结果 | 上游提交 |"
-            echo "| --- | --- | --- |"
-            echo "| 服务端 VCPToolBox | $(state "${{ needs.backend.result }}") | \`${{ needs.detect.outputs.backend_sha }}\` |"
-            echo "| 移动端 VCPMobile | $(state "${{ needs.mobile.result }}") | \`${{ needs.detect.outputs.mobile_sha }}\` |"
-            echo "| 桌面端 VCPChat | $(state "${{ needs.desktop.result }}") | \`${{ needs.detect.outputs.desktop_sha }}\` |"
+            echo "| 组件 | 版本 | 结果 | 上游提交 |"
+            echo "| --- | --- | --- | --- |"
+            echo "| 服务端 VCPToolBox | \`${{ needs.detect.outputs.backend_version }}\` | $(state "${{ needs.backend.result }}") | \`${{ needs.detect.outputs.backend_sha }}\` |"
+            echo "| 移动端 VCPMobile | \`${{ needs.detect.outputs.mobile_version }}\` | $(state "${{ needs.mobile.result }}") | \`${{ needs.detect.outputs.mobile_sha }}\` |"
+            echo "| 桌面端 VCPChat | \`${{ needs.detect.outputs.desktop_version }}\` | $(state "${{ needs.desktop.result }}") | \`${{ needs.detect.outputs.desktop_sha }}\` |"
+            echo ""
+            echo "版本号取自上游仓库的最新 tag，与实际构建的代码一致。"
             echo ""
             echo "「无变更」表示上游这轮没有新提交，不代表出错。点进去可以下载上一次的成品。"
             echo ""
