@@ -307,13 +307,16 @@ if (Test-Path $DeployDir) {
 # ---- 5. 安装 ----
 try {
     if ($setup) {
-        Log "静默安装"
-        $proc = Start-Process -FilePath $file -ArgumentList "/S" -Wait -PassThru
+        Log "静默安装到 $DeployDir"
+        # NSIS 的 /D 必须放最后、不加引号，否则会被当成参数的一部分。
+        # 不指定的话装到当前身份的 %LOCALAPPDATA%\Programs\vcp-chat-desktop，
+        # 服务账户和交互用户的路径不一样，等于同一台机器装出两份。
+        $proc = Start-Process -FilePath $file -ArgumentList "/S", "/D=$DeployDir" -Wait -PassThru
         if ($proc.ExitCode -ne 0) { throw "安装程序返回 $($proc.ExitCode)" }
         Log "安装完成"
     }
     else {
-        Log "解压免安装版"
+        Log "解压免安装版到 $DeployDir"
         if (-not (Test-Path $DeployDir)) { New-Item -ItemType Directory -Force -Path $DeployDir | Out-Null }
         Expand-Archive -Path $file -DestinationPath $DeployDir -Force
         Log "解压完成"
