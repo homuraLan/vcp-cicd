@@ -25,13 +25,15 @@ BLOCK = """# >>> plugin-native-build
 #
 # 只编译真正用得上的：PaperReader 依赖 bzip2/zstd 等 C 库，编译要额外装一堆
 # dev 包，而它的 manifest 是 .block（上游默认禁用），不编。
+#
+# 注意：RUN 的多行续行里不能夹注释行，否则 Docker 拼接时会断掉，
+# for 循环的 do 就配不上。注释只能放在 RUN 外面。
 RUN echo ">>> Building plugin native binaries..." && \\
     for spec in \\
       "DailyNoteSearcher/src:DailyNoteSearcher/DailyNoteSearcher-x86_64-unknown-linux-gnu" \\
     ; do \\
       src="${spec%%:*}"; \\
       out="${spec#*:}"; \\
-      # target/release 下的文件名是 crate 名，即插件名去掉平台后缀
       bin=$(basename "$out" | cut -d- -f1); \\
       if [ ! -f "Plugin/$src/Cargo.toml" ]; then \\
         echo "skip $src (no Cargo.toml)"; \\
@@ -60,8 +62,10 @@ def main() -> int:
     with open(path, "rb") as fh:
         raw = fh.read()
 
-    # 保留原文件的换行风格（上游是 CRLF）
-    crlf = b"\r\n" in raw
+    # 统一成 LF 再处理，插入的段落一律用 LF 写出。
+    # 上游文件是 CRLF，但 CRLF 会把 \r 留在续行符 \ 后面，Docker 拼出来的
+    # RUN 命令里就混进回车，shell 解析会出错（实测量出来的产物对不上）。
+    had_crlf = b"\r\n" in raw
     text = raw.decode("utf-8").replace("\r\n", "\n")
 
     if MARKER in text:
@@ -71,14 +75,16 @@ def main() -> int:
     # 插在 AdminPanel-Vue 构建之后、插件依赖安装之前
     anchor = "\n# 查找所有插件目录下的 requirements.txt"
     if anchor not in text:
-        print(f"::error::找不到插入点，Dockerfile 结构可能变了")
+        print("::error::找不到插入点，Dockerfile 结构可能变了")
         return 1
 
     text = text.replace(anchor, "\n" + BLOCK + anchor, 1)
 
-    out = text.replace("\n", "\r\n") if crlf else text
+    # 整个文件写成 LF：Docker 两种都能读，混用反而容易出上面的续行问题
+    if had_crlf:
+        print("原文件是 CRLF，已转为 LF 以避免续行符失效")
     with open(path, "wb") as fh:
-        fh.write(out.encode("utf-8"))
+        fh.write(text.encode("utf-8"))
 
     print("已补入插件编译段")
     return 0
