@@ -1202,6 +1202,10 @@ jobs:
           DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           TARGET_SHA: ${{ needs.detect.outputs.backend_sha }}
           HEALTH_URL: ${{ vars.VCP_SERVER_URL }}
+          TARGET_TAG: ${{ needs.release.outputs.tag }}
+          INTERVAL_H: ${{ vars.VCP_SERVER_INTERVAL_H || '168' }}
+          # 手动触发意味着「我就是要现在换上」；定时触发才按间隔算。
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: |
           chmod +x ci/deploy/update-server.sh
           # 镜像只按短 hash 打标，拉取必须用同一个名字
@@ -1251,6 +1255,9 @@ jobs:
           TAG: ${{ needs.release.outputs.tag }}
           REPO: ${{ github.repository }}
           INTERVAL_H: ${{ vars.VCP_CHAT_INTERVAL_H || '168' }}
+          # 手动触发意味着「我就是要现在装上」，不能又被间隔拦回去。
+          # 定时触发才按间隔算，避免隔三差五重启客户端。
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: |
           if (-not $env:CHAT_DIR) {
             Write-Host "VCP_CHAT_DIR not set, skip"
@@ -1264,7 +1271,8 @@ jobs:
           try {
             $hours = 168
             if ($env:INTERVAL_H) { [int]::TryParse($env:INTERVAL_H, [ref]$hours) | Out-Null }
-            & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo $env:REPO -IntervalHours $hours
+            $force = ($env:FORCE -eq '1')
+            & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo $env:REPO -IntervalHours $hours -Force:$force
             if (-not $?) { exit 1 }
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             exit 0

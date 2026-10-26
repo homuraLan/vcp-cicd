@@ -96,6 +96,10 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 # ---- 3. 下载并校验 ----
 $target = if ($setup) { $setup } else { $portable }
 Log "下载 $target"
+# 这个包有四百多兆，服务账户走代理时慢得离谱。
+# gh 默认不打印进度，20 分钟超时前日志里只有一个「下载 xxx」，
+# 看不出卡在哪。所以把 gh 自己的输出实时透出来，慢也看得见进度。
+$env:GH_PROGRESS = "1"
 & gh release download $Tag --repo $Repo --pattern $target --dir $tmp
 if ($LASTEXITCODE -ne 0) {
     Log "下载失败"
@@ -125,7 +129,8 @@ if ($LASTEXITCODE -eq 0 -and (Test-Path (Join-Path $tmp $sumName))) {
 $backup = Join-Path $DeployDir ".backup"
 if (Test-Path $backup) { Remove-Item $backup -Recurse -Force }
 if (Test-Path $DeployDir) {
-    $existing = Get-ChildItem $DeployDir -Exclude ".backup", ".deployed-tag" -ErrorAction SilentlyContinue
+    # 状态文件不是程序的一部分，别卷进备份再回滚回去
+    $existing = Get-ChildItem $DeployDir -Exclude ".backup", ".deployed-tag", ".last-pull.at" -ErrorAction SilentlyContinue
     if ($existing) {
         New-Item -ItemType Directory -Force -Path $backup | Out-Null
         foreach ($item in $existing) {
