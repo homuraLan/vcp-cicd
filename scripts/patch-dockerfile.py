@@ -46,9 +46,11 @@ RUN echo ">>> Building plugin native binaries..." && \\
       mkdir -p "$(dirname "Plugin/$out")"; \\
       cp "Plugin/$src/target/release/$bin" "Plugin/$out" || { echo "!!! 复制失败"; exit 1; }; \\
       chmod +x "Plugin/$out"; \\
+      test -x "Plugin/$out" || { echo "!!! 产物不可执行"; exit 1; }; \\
       echo "    -> $(wc -c < "Plugin/$out") bytes"; \\
     done && \\
-    echo ">>> plugin native build complete."
+    echo ">>> plugin native build complete." && \\
+    ls -la Plugin/DailyNoteSearcher/ | grep x86_64-unknown
 # <<< plugin-native-build
 """
 
