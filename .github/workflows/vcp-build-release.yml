@@ -408,6 +408,19 @@ jobs:
           docker push "$IMAGE:latest"
           echo "已推送 $IMAGE$PUSHED / :latest"
 
+      - name: 清理旧镜像（只留最新 10 个）
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          KEEP_SHA: ${{ steps.meta.outputs.short }}
+          KEEP_VER: ${{ steps.build.outputs.ver_tag }}
+        run: |
+          if [ -z "$DH_TOKEN" ]; then
+            echo "未配置凭证，跳过清理"
+            exit 0
+          fi
+          python3 ci/scripts/prune-dockerhub.py
+
       - name: 更新 Docker Hub 仓库说明
         env:
           DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
