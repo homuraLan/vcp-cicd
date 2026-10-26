@@ -855,8 +855,13 @@ jobs:
           $ver = $env:APP_VERSION
           if ($ver) {
             $ver = $ver.TrimStart("v")
-            # electron-builder 要求三段式，日期版本补一个 .0
-            if ($ver -match '^\d{4}\.\d{2}\.\d{2}$') { $ver = "$ver.0" }
+            # Windows 版本资源是四段 16 位整数，而且显示时会把数字串拆成
+            # 「主版本.次版本-修订.构建」来看，直接塞 2026.10.26.0 会显示成
+            # 2026.10.2-6.0，看不出是哪天。这里压成 2026.1026.0.0：
+            # 年.月日.修订.构建，四段都在范围内，也能一眼读出日期。
+            if ($ver -match '^(\d{4})\.(\d{2})\.(\d{2})$') {
+              $ver = "$($Matches[1]).$($Matches[2])$($Matches[3]).0.0"
+            }
             $pkgPath = Join-Path (Get-Location) "package.json"
             $raw = Get-Content $pkgPath -Raw -Encoding utf8
             # 只替换顶层 version，不用 ConvertTo-Json 整写，

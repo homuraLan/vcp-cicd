@@ -153,6 +153,11 @@ if (-not $DeployDir) {
     }
 }
 
+# 程序装到 DeployDir 下的 app 子目录，不要直接铺在 DeployDir 根上。
+# DeployDir 同时还是编译工作目录，里面有 src / out / logs 这些构建产物；
+# 安装版铺在根上会跟它们混在一起，卸载时更会把整个目录连同源码一起删掉。
+$InstallDir = Join-Path $DeployDir "app"
+
 # ---- 0. 到间隔了没有 ----
 # 上游照常编译，这里管的是本机多久去拉一次。
 $pullStamp = Join-Path $DeployDir ".last-pull.at"
@@ -292,9 +297,8 @@ if ($LASTEXITCODE -eq 0 -and (Test-Path (Join-Path $tmp $sumName))) {
 # ---- 4. 备份旧版本，准备回滚 ----
 $backup = Join-Path $DeployDir ".backup"
 if (Test-Path $backup) { Remove-Item $backup -Recurse -Force }
-if (Test-Path $DeployDir) {
-    # 状态文件不是程序的一部分，别卷进备份再回滚回去
-    $existing = Get-ChildItem $DeployDir -Exclude ".backup", ".deployed-tag", ".last-pull.at" -ErrorAction SilentlyContinue
+if (Test-Path $InstallDir) {
+    $existing = Get-ChildItem $InstallDir -ErrorAction SilentlyContinue
     if ($existing) {
         New-Item -ItemType Directory -Force -Path $backup | Out-Null
         foreach ($item in $existing) {
@@ -314,7 +318,7 @@ try {
         # MSBuild 中间目录（.tlog / .obj / src 多层嵌套），
         # 下次安装就会弹 "Failed to uninstall old application files" 并以退出码 2 失败。
         # 先跑一次卸载器，再把剩下的目录整个删掉，安装才不会卡在这一步。
-        $uninst = Get-ChildItem $DeployDir -Filter "Uninstall*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+        $uninst = Get-ChildItem $InstallDir -Filter "Uninstall*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($uninst) {
             Log "清理旧版本"
             try {
@@ -323,38 +327,32 @@ try {
                 Log "卸载器执行异常（继续）：$($_.Exception.Message)"
             }
             Start-Sleep -Seconds 2
-            # 卸载器删不掉的部分直接兜底删
-            if (Test-Path $DeployDir) { Remove-Item $DeployDir -Recurse -Force -ErrorAction SilentlyContinue }
-            Start-Sleep -Seconds 1
         }
+        # 兜底只删安装目录，绝不能碰 DeployDir 本身 —— 那里还有 src / out / logs
+        if (Test-Path $InstallDir) { Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 1
 
-        Log "静默安装到 $DeployDir"
+        Log "静默安装到 $InstallDir"
         # NSIS 的 /D 必须放最后、不加引号，否则会被当成参数的一部分。
         # 不指定的话装到当前身份的 %LOCALAPPDATA%\Programs\vcp-chat-desktop，
         # 服务账户和交互用户的路径不一样，等于同一台机器装出两份。
-        $proc = Start-Process -FilePath $file -ArgumentList "/S", "/D=$DeployDir" -Wait -PassThru
+        $proc = Start-Process -FilePath $file -ArgumentList "/S", "/D=$InstallDir" -Wait -PassThru
         if ($proc.ExitCode -ne 0) { throw "安装程序返回 $($proc.ExitCode)" }
         Log "安装完成"
     }
     else {
-        Log "解压免安装版到 $DeployDir"
-        if (-not (Test-Path $DeployDir)) { New-Item -ItemType Directory -Force -Path $DeployDir | Out-Null }
-        Expand-Archive -Path $file -DestinationPath $DeployDir -Force
+        Log "解压免安装版到 $InstallDir"
+        if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null }
+        Expand-Archive -Path $file -DestinationPath $InstallDir -Force
         Log "解压完成"
     }
 
-    # ---- 5.5. 修数据目录 + 建快捷方式 ----
+    # ---- 5.5. 建快捷方式 ----
     #
-    # 安装版的致命坑：上游 main.js 里 PROJECT_ROOT = __dirname，
-    # 数据目录默认取 __dirname\AppData。打包后 __dirname 指向 app.asar 内部，
-    # 而 asar 是只读归档，于是启动时 fs.ensureDirSync 直接抛错，
-    # 窗口永远等不到 did-finish-load，表现就是「进程开一堆、界面不出现」。
-    # 上游留了后门：设 VCPCHAT_APP_DATA_DIR 就跳过这个推导（main.js 第 315 行）。
-    # 快捷方式里把环境变量带上，双击才能正常启动。
-    $dataDir = Join-Path $env:APPDATA "vcp-chat-desktop"
-    New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
-
-    $appExe = Get-ChildItem $DeployDir -Filter "*.exe" -ErrorAction SilentlyContinue |
+    # 数据目录的问题已经在打包阶段修掉了（main.js 里改成打包后取
+    # path.dirname(app.getPath('exe'))，数据跟着程序目录走），
+    # 这里不需要再塞 VCPCHAT_APP_DATA_DIR 去绕过。
+    $appExe = Get-ChildItem $InstallDir -Filter "*.exe" -ErrorAction SilentlyContinue |
               Where-Object { $_.Name -notmatch "^Uninstall" } |
               Sort-Object Length -Descending | Select-Object -First 1
 
@@ -366,14 +364,17 @@ try {
         $ws = New-Object -ComObject WScript.Shell
         $lnk = $ws.CreateShortcut($lnkPath)
         $lnk.TargetPath = $appExe.FullName
-        $lnk.WorkingDirectory = $DeployDir
+        $lnk.WorkingDirectory = $InstallDir
         $lnk.Description = "VCP 聊天客户端"
         $lnk.Save()
         [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($ws)
 
-        # 直接写进用户环境变量，从资源管理器或任何方式启动都能生效
-        [Environment]::SetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", $dataDir, "User")
-        Log "数据目录 $dataDir，快捷方式已创建"
+        # 老版本靠这个变量才能启动，留着会把数据指到别处去，清掉
+        if ([Environment]::GetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", "User")) {
+            [Environment]::SetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", $null, "User")
+            Log "已清除旧的 VCPCHAT_APP_DATA_DIR（新包不需要）"
+        }
+        Log "快捷方式已创建"
     }
     else {
         Log "警告: 安装目录里没找到主程序，跳过快捷方式"
@@ -389,7 +390,7 @@ catch {
     if (Test-Path $backup) {
         Log "回滚"
         Get-ChildItem $backup -ErrorAction SilentlyContinue | ForEach-Object {
-            Copy-Item $_.FullName -Destination $DeployDir -Recurse -Force -ErrorAction SilentlyContinue
+            Copy-Item $_.FullName -Destination $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
     exit 1
