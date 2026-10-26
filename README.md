@@ -145,7 +145,22 @@ docker pull homuralan/vcptoolbox:latest
 <details>
 <summary><b>多久更新一次</b></summary>
 
-上游有新提交时自动构建，检查间隔 6 小时。Releases 里的版本号带日期和运行号。
+上游有新提交时自动构建，检查间隔 6 小时。
+
+版本号直接沿用上游仓库的最新 tag，跟上游对得上：服务端是 `v1.13.0` 这种，
+移动端是 `v1.1.6`。同一上游版本重复构建时追加 `.N`（如 `v1.13.0.2`）保证唯一。
+一版里同时更新了多个组件时，标签会带上各自版本，如 `v1.13.0.1.1.6`。
+
+</details>
+
+<details>
+<summary><b>Linux 二进制包里能直接跑吗</b></summary>
+
+能。里面是完整的应用目录（源码 + node_modules + pydeps + 插件依赖 + 编译好的
+原生模块），面向 `node:20-alpine` 的 musl 运行环境。
+
+插件里用 Rust 写的子项目（DailyNoteSearcher 等）在构建时一并编译，
+上游仓库只放了部分平台的预编译文件，缺的那个由 CI 补上。
 
 </details>
 
