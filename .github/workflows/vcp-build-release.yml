@@ -6,6 +6,15 @@ name: VCP Build & Release
 #   mobile   —— VCPMobile Android APK（ubuntu 上交叉编译）
 #   desktop  —— VCPChat Windows 客户端（windows 上原生构建）
 #
+# 编排原则（别退化）：
+#   编译一律在云端 runner 上做完，本机只负责把成品拉下来装上。
+#   本机没有编译环境，也不该有——一旦某一端依赖本机编译，
+#   这台机器不开就没法出新版本了。
+#   目前三端云端都能编完，所以没有任何一端走本机编译这条路。
+#   万一将来某一端云端实在编不出来，才由本机 runner 编译，
+#   那种情况下编完就地安装、不再走「下载 + 拉取间隔」那一套，
+#   否则等于把同一个包又下了一遍。
+#
 # 局域网分发：workflow 结束后由 NAS 上的同步任务把 Release 产物拉到本地目录，
 # 手机和 PC 从局域网地址下载更新。
 #
@@ -1241,6 +1250,7 @@ jobs:
           CHAT_DIR: ${{ vars.VCP_CHAT_DIR }}
           TAG: ${{ needs.release.outputs.tag }}
           REPO: ${{ github.repository }}
+          INTERVAL_H: ${{ vars.VCP_CHAT_INTERVAL_H || '168' }}
         run: |
           if (-not $env:CHAT_DIR) {
             Write-Host "VCP_CHAT_DIR not set, skip"
@@ -1252,7 +1262,9 @@ jobs:
           }
           $ErrorActionPreference = 'Stop'
           try {
-            & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo $env:REPO
+            $hours = 168
+            if ($env:INTERVAL_H) { [int]::TryParse($env:INTERVAL_H, [ref]$hours) | Out-Null }
+            & .\ci\deploy\update-chat.ps1 -Tag $env:TAG -DeployDir $env:CHAT_DIR -Repo $env:REPO -IntervalHours $hours
             if (-not $?) { exit 1 }
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             exit 0
