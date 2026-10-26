@@ -47,11 +47,18 @@ function Get-FileParallel {
         [int]$Retries = 3
     )
 
+    # token 只发给 api.github.com。
+    # 浏览器直链会跳到 release-assets.githubusercontent.com，那边不认 GitHub token，
+    # 带上 Authorization 反而直接 401。
+    $needAuth = $Uri -match '^https://api\.github\.com/'
+    $authVal = if ($needAuth -and $env:GH_TOKEN) { "Bearer $($env:GH_TOKEN)" } else { $null }
+
     $head = [System.Net.HttpWebRequest]::Create($Uri)
     $head.Method = "HEAD"
     $head.Timeout = 30000
     $head.AllowAutoRedirect = $true
-    if ($env:GH_TOKEN) { $head.Headers.Add("Authorization", "Bearer $($env:GH_TOKEN)") }
+    $head.UserAgent = "vcp-deploy"
+    if ($authVal) { $head.Headers.Add("Authorization", $authVal) }
     $hr = $head.GetResponse()
     $size = [int64]$hr.ContentLength
     $ranges = $hr.Headers["Accept-Ranges"]
@@ -65,7 +72,8 @@ function Get-FileParallel {
         Log "服务器不支持分片，改用单流下载（$mb MB）"
         $single = [System.Net.HttpWebRequest]::Create($Uri)
         $single.Timeout = 60000
-        if ($env:GH_TOKEN) { $single.Headers.Add("Authorization", "Bearer $($env:GH_TOKEN)") }
+        $single.UserAgent = "vcp-deploy"
+        if ($authVal) { $single.Headers.Add("Authorization", $authVal) }
         $sr = $single.GetResponse()
         $sr.GetResponseStream().CopyTo([System.IO.File]::Create($OutFile))
         $sr.Close()
@@ -90,6 +98,7 @@ function Get-FileParallel {
                     $req = [System.Net.HttpWebRequest]::Create($u)
                     $req.Timeout = 60000
                     $req.ReadWriteTimeout = 60000
+                    $req.UserAgent = "vcp-deploy"
                     $req.AddRange($a, $b)
                     if ($tok) { $req.Headers.Add("Authorization", "Bearer $tok") }
                     $resp = $req.GetResponse()
@@ -110,7 +119,7 @@ function Get-FileParallel {
                 }
             }
             return "fail: $err"
-        } -ArgumentList $Uri, $from, $to, $slice, $Retries, $env:GH_TOKEN
+        } -ArgumentList $Uri, $from, $to, $slice, $Retries, $(if ($authVal) { $env:GH_TOKEN } else { "" })
     }
 
     $null = $tasks | Wait-Job
@@ -206,31 +215,48 @@ Log "下载 $target"
 
 # GitHub 对单连接限速，gh 的 download 只能单流，四百多兆要下十几分钟。
 # 这里改成拿 asset 直链，自己分片并行下载。
-# Accept: octet-stream 才会重定向到真实文件地址，默认返回的是 JSON。
 try {
-    $url = & gh api "repos/$Repo/releases/tags/$Tag" `
-        --jq ".assets[] | select(.name == `"$target`") | .url" 2>&1
-    if (-not $url -or $url -match '^(gh:|warning)') { throw "没有找到资产 $target" }
-    $url = ($url | Select-Object -First 1).Trim()
+    # 用 release view 拿资产地址。
+    # 不用 gh api + jq：那段 jq 里要嵌双引号和变量，在 5.1 里转义极易出错，
+    # 一旦 gh 输出的是错误对象，取出来的是 ErrorRecord，.Trim() 直接崩。
+    $raw = & gh release view $Tag --repo $Repo --json assets 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $raw) { throw "查询发布失败" }
+    $rel = $raw | ConvertFrom-Json
+    $asset = @($rel.assets) | Where-Object { $_.name -eq $target } | Select-Object -First 1
+    if (-not $asset) { throw "没有找到资产 $target" }
 
     $file = Join-Path $tmp $target
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-    # asset.url 是 API 地址，加 octet-stream 头才会跳转到文件本体
-    $req = [System.Net.HttpWebRequest]::Create($url)
-    $req.Method = "GET"
-    $req.AllowAutoRedirect = $false
-    $req.Headers.Add("Authorization", "Bearer $($env:GH_TOKEN)")
-    $req.Accept = "application/octet-stream"
-    try { $resp = $req.GetResponse() } catch { $resp = $null }
-    $realUri = $url
-    if ($resp) {
-        if ([int]$resp.StatusCode -ge 300 -and [int]$resp.StatusCode -lt 400) {
-            $realUri = $resp.Headers["Location"]
+    # 公开仓库用 asset.url 直接下，浏览器地址，不需要额外换跳转。
+    # 私有仓库那个地址要鉴权，退回 apiUrl 换一次 Location。
+    #
+    # 坑：AllowAutoRedirect=false 时 302 会让 GetResponse 直接抛 WebException，
+    # 响应对象在异常里、不在返回值里。只在成功分支读 Location 会永远读到空，
+    # 于是整段并行下载静默退回单流 —— 看着没报错，其实没生效。
+    $realUri = $null
+    if ($asset.url) { $realUri = [string]$asset.url }
+    if (-not $realUri -or $asset.apiUrl) {
+        $probe = [System.Net.HttpWebRequest]::Create([string]$asset.apiUrl)
+        $probe.Method = "GET"
+        $probe.AllowAutoRedirect = $false
+        $probe.UserAgent = "vcp-deploy"
+        $probe.Headers.Add("Authorization", "Bearer $($env:GH_TOKEN)")
+        $probe.Accept = "application/octet-stream"
+        try {
+            $resp = $probe.GetResponse()
+            $code = [int]$resp.StatusCode
+            if ($code -ge 300 -and $code -lt 400) { $realUri = $resp.Headers["Location"] }
+            $resp.Close()
+        } catch [System.Net.WebException] {
+            $er = $_.Exception.Response
+            if ($er) {
+                $code = [int]$er.StatusCode
+                if ($code -ge 300 -and $code -lt 400) { $realUri = $er.Headers["Location"] }
+            }
         }
-        $resp.Close()
     }
-    if (-not $realUri -or $realUri -eq $url) { throw "拿不到文件直链" }
+    if (-not $realUri) { throw "拿不到文件直链" }
 
     Get-FileParallel -Uri $realUri -OutFile $file -Parts 8
     $sw.Stop()
