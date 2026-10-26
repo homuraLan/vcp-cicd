@@ -104,6 +104,9 @@ docker pull homuralan/vcptoolbox:latest
 | `v1.13.0` 这样的版本号 | 对应上游版本，跟 Release 标签对得上 |
 | `dd4f7032` 这样的短 hash | 精确对应某个上游提交，回滚用 |
 
+每次构建完会自动清理旧标签，只保留最新 10 个版本（`latest` 除外）。
+想回滚到更早的版本，用 Release 里留着的 tar 包。
+
 需要配置文件才能启动。参考上游 [VCPToolBox](https://github.com/lioensky/VCPToolBox) 的部署说明。
 镜像说明会随每次构建自动更新到 Docker Hub 页面。
 
