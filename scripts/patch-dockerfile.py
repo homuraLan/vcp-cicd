@@ -22,10 +22,12 @@ BLOCK = """# >>> plugin-native-build
 # 插件里的 Rust 子项目需要现场编译。上游只在仓库里放了部分平台的预编译
 # 二进制，x86_64-linux 缺好几个，不编译就会在运行时找不到可执行文件。
 # 产物按插件 JS 里的命名约定放回插件目录，它按这个名字查找。
+#
+# 只编译真正用得上的：PaperReader 依赖 bzip2/zstd 等 C 库，编译要额外装一堆
+# dev 包，而它的 manifest 是 .block（上游默认禁用），不编。
 RUN echo ">>> Building plugin native binaries..." && \\
     for spec in \\
       "DailyNoteSearcher/src:DailyNoteSearcher/DailyNoteSearcher-x86_64-unknown-linux-gnu" \\
-      "PaperReader/paperreader-rs:PaperReader/bin/paperreader-cli" \\
     ; do \\
       src="${spec%%:*}"; \\
       out="${spec#*:}"; \\
@@ -39,7 +41,7 @@ RUN echo ">>> Building plugin native binaries..." && \\
       cp "Plugin/$src/target/release/$(basename "$out")" "Plugin/$out" 2>/dev/null || \\
         cp "Plugin/$src/target/release/$(basename "$src")" "Plugin/$out"; \\
       chmod +x "Plugin/$out"; \\
-      echo "    -> $(ls -l "Plugin/$out" | awk '{print $5}') bytes"; \\
+      echo "    -> $(stat -c %s "Plugin/$out") bytes"; \\
     done && \\
     echo ">>> plugin native build complete."
 # <<< plugin-native-build
