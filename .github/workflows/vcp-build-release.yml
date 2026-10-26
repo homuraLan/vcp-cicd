@@ -72,6 +72,9 @@ jobs:
       backend_url: ${{ steps.last.outputs.backend_url }}
       mobile_url: ${{ steps.last.outputs.mobile_url }}
       desktop_url: ${{ steps.last.outputs.desktop_url }}
+      backend_art_sha: ${{ steps.last.outputs.backend_art_sha }}
+      mobile_art_sha: ${{ steps.last.outputs.mobile_art_sha }}
+      desktop_art_sha: ${{ steps.last.outputs.desktop_art_sha }}
       backend_version: ${{ steps.ver.outputs.backend_version }}
       mobile_version: ${{ steps.ver.outputs.mobile_version }}
       desktop_version: ${{ steps.ver.outputs.desktop_version }}
@@ -194,16 +197,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 逐页往前翻，找到第一个带目标产物的发布就停。
+          # 逐页往前翻，找到带目标产物的发布就停。
           # 3 页 × 30 条足够覆盖很久了，再往前翻纯属浪费 API 配额。
           # python 必须写成单行：多行代码会从第 0 列开始，破坏 run 块缩进。
+          #
+          # 排序必须按 published_at，不能用 API 默认顺序。
+          # API 默认按 created_at 排，而 created_at 在同一轮里是创建那一刻定的：
+          # 实测出现过两个 release 同为 21:27 创建、实际先后发布，
+          # 按 created_at 取第一个会指到真正的旧版本上去。
           find_release() {
             pattern="$1"
             for page in 1 2 3; do
               hit=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${{ github.repository }}/releases?per_page=30&page=$page" \
-                | PATTERN="$pattern" python3 -c "import sys,os,json,fnmatch; p=os.environ['PATTERN']; d=json.load(sys.stdin); d=d if isinstance(d,list) else []; ms=[r.get('tag_name','') for r in d if not r.get('draft') for a in r.get('assets',[]) if fnmatch.fnmatch(a.get('name',''), p)]; print(ms[0] if ms else '')" 2>/dev/null || echo "")
+                | PATTERN="$pattern" python3 -c "import sys,os,json,fnmatch; p=os.environ['PATTERN']; d=json.load(sys.stdin); d=d if isinstance(d,list) else []; ms=[(r.get('published_at') or r.get('created_at') or '', r.get('tag_name','')) for r in d if not r.get('draft') for a in r.get('assets',[]) if fnmatch.fnmatch(a.get('name',''), p)]; ms.sort(reverse=True); print(ms[0][1] if ms else '')" 2>/dev/null || echo "")
               if [ -n "$hit" ]; then
                 echo "$hit"
                 return
@@ -217,6 +225,18 @@ jobs:
             if [ -n "$1" ]; then echo "$BASE/tag/$1"; else echo "$BASE"; fi
           }
 
+          # 从某个 release 的说明里抠出指定组件那一行的上游提交。
+          # 跳过的组件在本次摘要里写的是「本轮检测到的 SHA」，可它的成品其实是
+          # 早先某次构建出来的，两者对不上。这里把成品真正对应的 SHA 取回来。
+          sha_of() {
+            tag="$1"; label="$2"
+            [ -n "$tag" ] || { echo ""; return; }
+            curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" \
+              | LABEL="$label" python3 -c "import sys,os,json,re; d=json.load(sys.stdin); b=d.get('body') or ''; lab=os.environ['LABEL']; m=re.search(r'^\|\s*'+re.escape(lab)+r'[^|]*\|[^|]*\|[^|]*\|\s*\`([0-9a-f]{7,40})\`', b, re.M); print(m.group(1) if m else '')" 2>/dev/null || echo ""
+          }
+
           BE=$(find_release 'vcptoolbox-*.tar.gz')
           MB=$(find_release '*.apk')
           DE=$(find_release '*Setup*.exe')
@@ -224,6 +244,11 @@ jobs:
           echo "backend_url=$(url_of "$BE")" >> "$GITHUB_OUTPUT"
           echo "mobile_url=$(url_of "$MB")" >> "$GITHUB_OUTPUT"
           echo "desktop_url=$(url_of "$DE")" >> "$GITHUB_OUTPUT"
+
+          # 各成品真正对应的上游提交，供跳过的组件显示
+          echo "backend_art_sha=$(sha_of "$BE" '服务端 VCPToolBox')" >> "$GITHUB_OUTPUT"
+          echo "mobile_art_sha=$(sha_of "$MB" '移动端 VCPMobile')" >> "$GITHUB_OUTPUT"
+          echo "desktop_art_sha=$(sha_of "$DE" '桌面端 VCPChat')" >> "$GITHUB_OUTPUT"
 
           echo "服务端成品: ${BE:-无}"
           echo "移动端成品: ${MB:-无}"
@@ -242,23 +267,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 跳过的组件不是「没东西」，而是「已经在别处发过了」，要给个跳转链接
+          # 跳过的组件不是「没东西」，而是「已经在别处发过了」，要给个跳转链接。
+          # 链接要按组件分别给：各自成品所在的发布未必是同一个。
           mark() {
             if [ "$1" = "true" ]; then
               echo "本次构建"
+            elif [ -n "$2" ]; then
+              echo "[无更新，跳转到成品]($2)"
+            elif [ -n "$LAST_URL" ]; then
+              echo "[无更新](${LAST_URL})"
             else
-              echo "[无更新，用最近一版](${LAST_URL})"
+              echo "无更新"
             fi
           }
+
+          BE_U="${{ steps.last.outputs.backend_url }}"
+          MB_U="${{ steps.last.outputs.mobile_url }}"
+          DE_U="${{ steps.last.outputs.desktop_url }}"
 
           {
             echo "### 上游检测"
             echo ""
             echo "| 组件 | 本次动作 | 上游提交 |"
             echo "| --- | --- | --- |"
-            echo "| VCPToolBox | $(mark "${{ steps.check.outputs.backend }}") | \`${{ steps.check.outputs.backend_sha }}\` |"
-            echo "| VCPMobile | $(mark "${{ steps.check.outputs.mobile }}") | \`${{ steps.check.outputs.mobile_sha }}\` |"
-            echo "| VCPChat | $(mark "${{ steps.check.outputs.desktop }}") | \`${{ steps.check.outputs.desktop_sha }}\` |"
+            echo "| VCPToolBox | $(mark "${{ steps.check.outputs.backend }}" "$BE_U") | \`${{ steps.check.outputs.backend_sha }}\` |"
+            echo "| VCPMobile | $(mark "${{ steps.check.outputs.mobile }}" "$MB_U") | \`${{ steps.check.outputs.mobile_sha }}\` |"
+            echo "| VCPChat | $(mark "${{ steps.check.outputs.desktop }}" "$DE_U") | \`${{ steps.check.outputs.desktop_sha }}\` |"
             echo ""
             if [ "$LAST_URL" != "" ]; then
               echo "最近一次发布：${LAST_URL}"
@@ -1130,6 +1164,24 @@ jobs:
           MB_URL="${{ needs.detect.outputs.mobile_url }}"
           DE_URL="${{ needs.detect.outputs.desktop_url }}"
 
+          # 上游提交这一列要写「这份成品实际是用哪个提交构建的」。
+          # 组件被跳过时，成品来自早先某次构建，用本轮检测到的 SHA 会误导人：
+          # 点进链接看到的是旧版，哈希值却印着新版，两边对不上。
+          sha_cell() {
+            result="$1"; cur="$2"; art="$3"
+            if [ "$result" = "success" ]; then
+              echo "\`$cur\`"
+            elif [ -n "$art" ] && [ "$art" = "$cur" ]; then
+              echo "\`$art\`"
+            elif [ -n "$art" ]; then
+              echo "\`$art\`（成品对应提交；本轮上游已是 \`${cur:0:8}\`）"
+            elif [ -n "$cur" ]; then
+              echo "\`$cur\`"
+            else
+              echo "—"
+            fi
+          }
+
           {
             echo "## VCP 自动构建"
             echo ""
@@ -1137,13 +1189,15 @@ jobs:
             echo ""
             echo "| 组件 | 版本 | 结果 | 上游提交 |"
             echo "| --- | --- | --- | --- |"
-            echo "| 服务端 VCPToolBox | \`${{ needs.detect.outputs.backend_version }}\` | $(state "${{ needs.backend.result }}" "$BE_URL") | \`${{ needs.detect.outputs.backend_sha }}\` |"
-            echo "| 移动端 VCPMobile | \`${{ needs.detect.outputs.mobile_version }}\` | $(state "${{ needs.mobile.result }}" "$MB_URL") | \`${{ needs.detect.outputs.mobile_sha }}\` |"
-            echo "| 桌面端 VCPChat | \`${{ needs.detect.outputs.desktop_version }}\` | $(state "${{ needs.desktop.result }}" "$DE_URL") | \`${{ needs.detect.outputs.desktop_sha }}\` |"
+            echo "| 服务端 VCPToolBox | \`${{ needs.detect.outputs.backend_version }}\` | $(state "${{ needs.backend.result }}" "$BE_URL") | $(sha_cell "${{ needs.backend.result }}" "${{ needs.detect.outputs.backend_sha }}" "${{ needs.detect.outputs.backend_art_sha }}") |"
+            echo "| 移动端 VCPMobile | \`${{ needs.detect.outputs.mobile_version }}\` | $(state "${{ needs.mobile.result }}" "$MB_URL") | $(sha_cell "${{ needs.mobile.result }}" "${{ needs.detect.outputs.mobile_sha }}" "${{ needs.detect.outputs.mobile_art_sha }}") |"
+            echo "| 桌面端 VCPChat | \`${{ needs.detect.outputs.desktop_version }}\` | $(state "${{ needs.desktop.result }}" "$DE_URL") | $(sha_cell "${{ needs.desktop.result }}" "${{ needs.detect.outputs.desktop_sha }}" "${{ needs.detect.outputs.desktop_art_sha }}") |"
             echo ""
             echo "版本号取自上游仓库的最新 tag，与实际构建的代码一致。"
             echo ""
             echo "「无变更」表示上游这轮没有新提交，不代表出错。点进去是该组件最近一次真正构建出来的成品。"
+            echo ""
+            echo "「上游提交」那列写的是**这份成品实际对应的提交**。组件跳过时成品是早先构建的，若与本轮检测到的上游不同，会一并标出。"
             echo ""
 
             # 有失败时明确写出来，别让用户以为是正常发布
