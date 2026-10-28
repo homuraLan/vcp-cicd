@@ -110,7 +110,9 @@ jobs:
           # 就把这个数加一，让下一次运行即使上游没动也重新打一次包。
           # v2: 注入数据目录补丁（安装版启动无窗口）+ 写入日期版本号
           # v4: package.json 保持三段 SemVer，Windows 文件版本另用 build.win.fileVersion 写四段
-          RECIPE_VERSION=v5
+          # v6: 构建前修正 Rust 助手配置路径（asar 内 __dirname 向上 2 级会落到
+          #     app.asar 这个文件上，fs.ensureDir 报 ENOTDIR；改为向上 4 级）
+          RECIPE_VERSION=v6
 
           # 读取上次记录的提交，没有就当空
           prev() {
