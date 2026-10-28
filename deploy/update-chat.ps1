@@ -376,9 +376,47 @@ try {
 
     # ---- 5.5. 建快捷方式 ----
     #
-    # 数据目录的问题已经在打包阶段修掉了（main.js 里改成打包后取
-    # path.dirname(app.getPath('exe'))，数据跟着程序目录走），
-    # 这里不需要再塞 VCPCHAT_APP_DATA_DIR 去绕过。
+    # ★ 数据目录必须放在安装目录【外面】。
+    #
+    # 平铺后安装目录就是 DeployDir，而 NSIS 安装器写入时会清空目标目录 ——
+    # 实测：脚本白名单已经保住了 .deployed-tag / .last-pull.at，
+    # 但 E:\vcpchat\AppData 照样被安装器删了。白名单只管得住脚本自己的
+    # Remove-Item，管不住安装器，所以「把 AppData 加进白名单」这条路走不通。
+    #
+    # 数据路径早先也试过放安装目录里（app\AppData），一样每次更新都丢 ——
+    # 因为它在安装器的作用范围之内。唯一可靠的做法是移出去。
+    #
+    # 客户端 main.js 原生支持：VCPCHAT_APP_DATA_DIR 有这个值就用它，
+    # 不用 exe 同级的 AppData。所以这里主动设上，而不是像以前那样清掉。
+    $dataRoot = Join-Path (Split-Path $DeployDir -Parent) "vcpchat-data"
+    if (-not (Test-Path $dataRoot)) {
+        New-Item -ItemType Directory -Force -Path $dataRoot | Out-Null
+        Log "已创建数据目录 $dataRoot"
+    }
+
+    # 旧数据在 <InstallDir>\AppData，第一次升级时搬过去
+    $legacyData = Join-Path $InstallDir "AppData"
+    if (Test-Path $legacyData) {
+        $items = Get-ChildItem $legacyData -Force -ErrorAction SilentlyContinue
+        if ($items) {
+            Log "迁移旧数据 $legacyData -> $dataRoot"
+            foreach ($it in $items) {
+                $dest = Join-Path $dataRoot $it.Name
+                # 目标已存在就不覆盖，避免把新数据盖回旧的
+                if (-not (Test-Path $dest)) {
+                    Copy-Item $it.FullName -Destination $dest -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+
+    # 用户级环境变量：从资源管理器/开始菜单启动都能读到
+    $prevData = [Environment]::GetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", "User")
+    if ($prevData -ne $dataRoot) {
+        [Environment]::SetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", $dataRoot, "User")
+        Log "已设置 VCPCHAT_APP_DATA_DIR = $dataRoot"
+    }
+
     $appExe = Get-ChildItem $InstallDir -Filter "*.exe" -ErrorAction SilentlyContinue |
               Where-Object { $_.Name -notmatch "^Uninstall" } |
               Sort-Object Length -Descending | Select-Object -First 1
@@ -395,12 +433,6 @@ try {
         $lnk.Description = "VCP 聊天客户端"
         $lnk.Save()
         [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($ws)
-
-        # 老版本靠这个变量才能启动，留着会把数据指到别处去，清掉
-        if ([Environment]::GetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", "User")) {
-            [Environment]::SetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", $null, "User")
-            Log "已清除旧的 VCPCHAT_APP_DATA_DIR（新包不需要）"
-        }
         Log "快捷方式已创建"
     }
     else {
