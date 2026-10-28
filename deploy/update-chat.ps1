@@ -294,24 +294,36 @@ try {
 }
 
 # 有校验值就核对
+#
+# 下载 sha256 失败不能让整段校验静默跳过 —— 那样「校验通过」和
+# 「根本没校验」看起来完全一样。缺文件就直接报错。
 $sumName = "$target.sha256"
 & gh release download $Tag --repo $Repo --pattern $sumName --dir $tmp 2>$null
-if ($LASTEXITCODE -eq 0 -and (Test-Path (Join-Path $tmp $sumName))) {
-    $expected = ((Get-Content (Join-Path $tmp $sumName) -Raw) -split '\s+')[0].ToLower()
-    $actual = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
-    if ($expected -ne $actual) {
-        Log "校验失败: 期望 $expected 实际 $actual"
-        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-        exit 1
-    }
-    Log "校验通过"
+if (-not (Test-Path (Join-Path $tmp $sumName))) {
+    Log "下载校验文件 $sumName 失败"
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    exit 1
 }
+$expected = ((Get-Content (Join-Path $tmp $sumName) -Raw) -split '\s+')[0].ToLower()
+$actual = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+if ($expected -ne $actual) {
+    Log "校验失败: 期望 $expected 实际 $actual"
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+Log "校验通过"
 
 # ---- 4. 备份旧版本，准备回滚 ----
-# InstallDir 与 DeployDir 现在是同一个目录，所以备份时必须排除元数据，
-# 尤其不能用递归把 .backup 自己套进去（会自我复制到爆盘）。
-$backup = Join-Path $DeployDir ".backup"
-if (Test-Path $backup) { Remove-Item $backup -Recurse -Force }
+# ★ 备份必须放在安装目录【外面】。
+#
+# 以前放 <DeployDir>\.backup，和安装目录同一棵树：
+#   - NSIS 安装器会清空整个目标目录，备份跟着一起没
+#   - finally 里无论如何都会把它删掉（见文件末尾）
+# 结果 catch 里的「回滚」永远是空的，等于没有回滚。
+# 改放到 DeployDir 的同级目录，和 vcpchat-data 并列，安装器碰不到。
+$backupRoot = Join-Path (Split-Path $DeployDir -Parent) "vcpchat-deploy-backup"
+$backup = $backupRoot
+if (Test-Path $backup) { Remove-Item $backup -Recurse -Force -ErrorAction SilentlyContinue }
 if (Test-Path $InstallDir) {
     $existing = Get-ChildItem $InstallDir -ErrorAction SilentlyContinue |
                 Where-Object { -not (Test-Preserved $_.Name) }
@@ -320,11 +332,12 @@ if (Test-Path $InstallDir) {
         foreach ($item in $existing) {
             Copy-Item $item.FullName -Destination $backup -Recurse -Force -ErrorAction SilentlyContinue
         }
-        Log "已备份旧版本（$($existing.Count) 项）"
+        Log "已备份旧版本到 $backup（$($existing.Count) 项）"
     }
 }
 
 # ---- 5. 安装 ----
+$installOk = $false
 try {
     if ($setup) {
         # 装之前先把旧版本清干净。
@@ -470,6 +483,7 @@ try {
     # 5.1 的 Set-Content -Encoding utf8 会写 BOM，下次读出来带 \ufeff 就比不相等了
     [System.IO.File]::WriteAllText($stampFile, $Tag, (New-Object System.Text.UTF8Encoding($false)))
     [System.IO.File]::WriteAllText($pullStamp, [string]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()))
+    $installOk = $true
     Log "更新完成: $Tag"
 }
 catch {
@@ -484,5 +498,13 @@ catch {
 }
 finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    if (Test-Path $backup) { Remove-Item $backup -Recurse -Force -ErrorAction SilentlyContinue }
+    # 只有装成功了才清理备份。
+    # 失败时留着，方便事后把文件拿回来 —— 以前无条件删，
+    # 回滚完备份就没了，真正出事时没有任何退路。
+    if ($installOk -and (Test-Path $backup)) {
+        Remove-Item $backup -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    elseif (Test-Path $backup) {
+        Log "安装未成功，保留备份于 $backup"
+    }
 }
