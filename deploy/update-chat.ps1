@@ -365,6 +365,34 @@ try {
         # 服务账户和交互用户的路径不一样，等于同一台机器装出两份。
         $proc = Start-Process -FilePath $file -ArgumentList "/S", "/D=$InstallDir" -Wait -PassThru
         if ($proc.ExitCode -ne 0) { throw "安装程序返回 $($proc.ExitCode)" }
+
+        # 安装器返回 0 不代表文件真的换成了新的。
+        # 实测：客户端正在运行时，exe 和 app.asar 被占用，覆盖失败，
+        # 但 .pak 之类没被占用的文件照样更新了，安装器仍然返回 0。
+        # 结果 tag 被写成新版本，实际主程序还是旧的，下次幂等检查直接跳过，
+        # 永远修不回来。
+        #
+        # 不能用文件修改时间判断：安装包里的时间戳来自打包时刻，
+        # 可能本来就很旧，会造成误报。改用哈希比对安装前后的实际内容。
+        $exePath = Join-Path $InstallDir "VCP聊天客户端.exe"
+        $asarPath = Join-Path $InstallDir "resources\app.asar"
+        $before = @{}
+        foreach ($f in @($exePath, $asarPath)) {
+            if (Test-Path $f) { $before[$f] = (Get-FileHash $f -Algorithm SHA256).Hash }
+        }
+        if ($before.Count -gt 0) {
+            $unchanged = @()
+            foreach ($f in $before.Keys) {
+                $now = (Get-FileHash $f -Algorithm SHA256).Hash
+                if ($now -eq $before[$f]) { $unchanged += (Split-Path $f -Leaf) }
+            }
+            if ($unchanged.Count -eq $before.Count) {
+                throw "安装后文件内容没有任何变化（多半是客户端还在运行占着文件）：$($unchanged -join ', ')。请退出客户端后重试。"
+            }
+            if ($unchanged.Count -gt 0) {
+                Log "警告: 这些文件未被更新（可能仍被占用）：$($unchanged -join ', ')"
+            }
+        }
         Log "安装完成"
     }
     else {
