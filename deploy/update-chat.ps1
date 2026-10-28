@@ -171,6 +171,23 @@ function Test-Preserved([string]$leaf) {
     return $Preserved -contains $leaf
 }
 
+# SHA256 一律走这个函数，不要用 Get-FileHash。
+#
+# 实测坑：self-hosted runner 跑在 NETWORK SERVICE 账户下，
+# PowerShell 5.1 处于 ConstrainedLanguage 模式，
+# Get-FileHash 根本不存在 —— 报 "The term 'Get-FileHash' is not recognized"。
+# 用 .NET 的 SHA256 才能在任何语言模式下跑通。
+function Get-Sha256([string]$Path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try {
+            $bytes = $sha.ComputeHash($fs)
+        } finally { $fs.Close() }
+    } finally { $sha.Dispose() }
+    return ([System.BitConverter]::ToString($bytes) -replace '-', '')
+}
+
 # ---- 0. 到间隔了没有 ----
 # 上游照常编译，这里管的是本机多久去拉一次。
 $pullStamp = Join-Path $DeployDir ".last-pull.at"
@@ -305,7 +322,7 @@ if (-not (Test-Path (Join-Path $tmp $sumName))) {
     exit 1
 }
 $expected = ((Get-Content (Join-Path $tmp $sumName) -Raw) -split '\s+')[0].ToLower()
-$actual = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+$actual = (Get-Sha256 $file).ToLower()
 if ($expected -ne $actual) {
     Log "校验失败: 期望 $expected 实际 $actual"
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -391,12 +408,12 @@ try {
         $asarPath = Join-Path $InstallDir "resources\app.asar"
         $before = @{}
         foreach ($f in @($exePath, $asarPath)) {
-            if (Test-Path $f) { $before[$f] = (Get-FileHash $f -Algorithm SHA256).Hash }
+            if (Test-Path $f) { $before[$f] = (Get-Sha256 $f) }
         }
         if ($before.Count -gt 0) {
             $unchanged = @()
             foreach ($f in $before.Keys) {
-                $now = (Get-FileHash $f -Algorithm SHA256).Hash
+                $now = (Get-Sha256 $f)
                 if ($now -eq $before[$f]) { $unchanged += (Split-Path $f -Leaf) }
             }
             if ($unchanged.Count -eq $before.Count) {
