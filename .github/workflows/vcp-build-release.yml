@@ -114,7 +114,10 @@ jobs:
           #     app.asar 这个文件上，fs.ensureDir 报 ENOTDIR；改为向上 4 级）
           # v7: 数据目录改到安装目录【外面】的 ..\vcpchat-data。NSIS 安装器
           #     每次安装都会清空整个目标目录，数据留在安装目录内必丢
-          RECIPE_VERSION=v7
+          # v8: 数据目录改回 <程序目录>\AppData。v7 是绕开安装器的权宜之计；
+          #     现在部署改成「装到暂存目录再复制过来，跳过 AppData」，
+          #     安装器不再碰到安装目录，数据可以留在原地
+          RECIPE_VERSION=v8
 
           # 读取上次记录的提交，没有就当空
           prev() {
