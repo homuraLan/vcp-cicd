@@ -1,4 +1,4 @@
-# VCPChat 桌面端自动更新
+﻿# VCPChat 桌面端自动更新
 #
 # 由 GitHub Actions 在构建完成后调用，也可以由 runner 定时轮询触发。
 #
