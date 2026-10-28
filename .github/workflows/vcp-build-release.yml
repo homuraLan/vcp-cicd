@@ -936,39 +936,29 @@ jobs:
           # 装到哪儿由部署脚本的 /D 决定，这里只保证「数据永远跟着程序走」。
           # 实测 process.execPath 就是安装目录里的主程序路径，dirname 即安装目录。
           #
-          # ★ 数据目录必须放在安装目录【外面】。
+          # ★ 数据目录保持「程序目录\AppData」，由部署脚本保证它不被清掉。
           #
-          # NSIS 安装器每次安装都会清空整个目标目录（实测：往目标目录里放
-          # .deployed-tag / AppData 当诱饵，跑一次安装全没了；放在安装目录
-          # 外面的同样文件则完好）。所以数据只要落在安装目录内，每次更新必丢 ——
-          # 带 app 子层也一样，因为那也在安装器的作用范围内。
-          #
-          # 改成「安装目录的同级目录 \vcpchat-data」：
-          #   exe 在 E:\vcpchat\VCP聊天客户端.exe
-          #   -> dirname = E:\vcpchat
-          #   -> ..\vcpchat-data = E:\vcpchat-data   （安装器碰不到）
-          #
-          # 不靠 VCPCHAT_APP_DATA_DIR 环境变量：部署跑在 NETWORK SERVICE 账户下，
-          # 它写 User 作用域只会写进服务账户，对登录用户无效；快捷方式也带不了环境变量。
+          # 实测：NSIS 安装器每次安装都会清空整个目标目录（往目标目录放
+          # .deployed-tag / AppData 当诱饵，跑一次安装全没了）。改卸载程序没用 ——
+          # 是安装器在动手。所以部署脚本改成「先装到临时目录，再把程序文件
+          # 复制到目标目录并跳过 AppData」，数据留在原地，这里不需要改路径。
           $mainJs = Join-Path (Get-Location) "main.js"
           if (Test-Path $mainJs) {
             $mj = Get-Content $mainJs -Raw -Encoding utf8
-            $mjOld = "const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot"
-            $mjNew = "path.join(path.dirname(app.getPath('exe')), '..', 'vcpchat-data')"
-            if ($mj.Contains($mjNew)) {
-              Write-Host "数据目录已是安装目录同级，跳过"
+            $mjTarget = "path.join(app.isPackaged ? path.dirname(app.getPath('exe')) : PROJECT_ROOT, 'AppData')"
+            if ($mj.Contains($mjTarget)) {
+              Write-Host "数据目录已是程序目录\AppData，跳过"
             }
-            elseif ($mj.Contains($mjOld)) {
-              # 正则同时兼容「上游原样」和「已被旧配方打过补丁」两种形态：
-              # 旧配方写进去的那行 : path.join(app.isPackaged ? ... ) 也要能命中，
-              # 否则换了配方再跑一次就替换不掉。
+            elseif ($mj.Contains("const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot")) {
+              # 正则同时兼容「上游原样」和「被旧配方改成 vcpchat-data 的形态」，
+              # 否则换回配方后替换不掉。
               $mj = [regex]::Replace(
                 $mj,
-                "const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot\r?\n\s*\? path\.resolve\(isolatedAppDataRoot\)\r?\n\s*: path\.join\((?:(?!;)[\s\S])*?, 'AppData'\);",
-                "const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot`r`n    ? path.resolve(isolatedAppDataRoot)`r`n    : app.isPackaged`r`n        ? path.join(path.dirname(app.getPath('exe')), '..', 'vcpchat-data')`r`n        : path.join(PROJECT_ROOT, 'AppData');"
+                "const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot\r?\n\s*\? path\.resolve\(isolatedAppDataRoot\)\r?\n\s*: (?:(?!;)[\s\S])*?;",
+                "const APP_DATA_ROOT_IN_PROJECT = isolatedAppDataRoot`r`n    ? path.resolve(isolatedAppDataRoot)`r`n    : path.join(app.isPackaged ? path.dirname(app.getPath('exe')) : PROJECT_ROOT, 'AppData');"
               )
               [System.IO.File]::WriteAllText($mainJs, $mj, (New-Object System.Text.UTF8Encoding($false)))
-              Write-Host "已修安装版数据目录: 打包后用安装目录同级的 vcpchat-data"
+              Write-Host "已修安装版数据目录: 打包后用程序目录\AppData"
             }
             else {
               # 打不上就别发了 —— 带这个病的安装包装出来是打不开的，

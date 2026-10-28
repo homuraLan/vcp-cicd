@@ -1,4 +1,4 @@
-﻿# VCPChat 桌面端自动更新
+# VCPChat 桌面端自动更新
 #
 # 由 GitHub Actions 在构建完成后调用，也可以由 runner 定时轮询触发。
 #
@@ -337,7 +337,7 @@ Log "校验通过"
 #   - NSIS 安装器会清空整个目标目录，备份跟着一起没
 #   - finally 里无论如何都会把它删掉（见文件末尾）
 # 结果 catch 里的「回滚」永远是空的，等于没有回滚。
-# 改放到 DeployDir 的同级目录，和 vcpchat-data 并列，安装器碰不到。
+# 改放到 DeployDir 的同级目录，安装器碰不到。
 $backupRoot = Join-Path (Split-Path $DeployDir -Parent) "vcpchat-deploy-backup"
 $backup = $backupRoot
 if (Test-Path $backup) { Remove-Item $backup -Recurse -Force -ErrorAction SilentlyContinue }
@@ -357,29 +357,33 @@ if (Test-Path $InstallDir) {
 $installOk = $false
 try {
     if ($setup) {
-        # 装之前先把旧版本清干净。
+        # ★ 不直接装到 InstallDir。
         #
-        # 为什么要手动做：NSIS 卸载程序处理不了 electron 的编译残留。
-        # 实测卸载后还留着 better-sqlite3 / electron-edge-js / node-pty 的
-        # MSBuild 中间目录（.tlog / .obj / src 多层嵌套），
-        # 下次安装就会弹 "Failed to uninstall old application files" 并以退出码 2 失败。
-        # 先跑一次卸载器，再把剩下的目录整个删掉，安装才不会卡在这一步。
-        $uninst = Get-ChildItem $InstallDir -Filter "Uninstall*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($uninst) {
-            Log "清理旧版本"
-            try {
-                Start-Process -FilePath $uninst.FullName -ArgumentList "/S", "/currentuser" -Wait -PassThru -ErrorAction Stop | Out-Null
-            } catch {
-                Log "卸载器执行异常（继续）：$($_.Exception.Message)"
-            }
-            Start-Sleep -Seconds 2
-        }
-        # 兜底清理：只删安装产物，保留部署元数据。
+        # 实测：NSIS 安装器每次安装都会清空整个目标目录，放在里面的
+        # AppData（用户数据）跟着一起没 —— 往目标目录放 settings.json 当诱饵，
+        # 跑一次安装就没了；改卸载程序也没用，动手的是安装器本身。
         #
-        # 这里以前是 Remove-Item $InstallDir -Recurse —— 那时 InstallDir 是
-        # DeployDir\app，整删安全。现在 InstallDir 就是 DeployDir 本身，
-        # 整删会把 .deployed-tag / .last-pull.at / .backup 一起干掉，
-        # 所以改成逐项删除并跳过 $Preserved。
+        # 所以分两步：先静默装到一个空的暂存目录，再把里面的程序文件
+        # 复制到 InstallDir，复制时跳过数据目录和部署元数据。
+        # 这样安装器碰不到 InstallDir，数据原地不动。
+        $stageDir = Join-Path $tmp "_stage"
+        Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+        Log "静默安装到暂存目录 $stageDir"
+        # NSIS 的 /D 必须放最后、不加引号，否则会被当成参数的一部分。
+        $proc = Start-Process -FilePath $file -ArgumentList "/S", "/D=$stageDir" -Wait -PassThru
+        if ($proc.ExitCode -ne 0) { throw "安装程序返回 $($proc.ExitCode)" }
+
+        $staged = Get-ChildItem $stageDir -Force -ErrorAction SilentlyContinue
+        if (-not $staged -or $staged.Count -eq 0) { throw "暂存目录是空的，安装包没解出东西" }
+        Log "暂存目录就绪（$($staged.Count) 项）"
+
+        # 清掉目标目录里的旧程序文件，但跳过数据目录和部署元数据。
+        #
+        # 数据目录在安装目录内（<InstallDir>\AppData），全靠 $Preserved 保住。
+        # 这里以前有个「先跑 NSIS 卸载器」的步骤，已去掉 ——
+        # 卸载器同样会清空目录，和安装器是同一个破坏者。
         if (Test-Path $InstallDir) {
             Get-ChildItem $InstallDir -Force -ErrorAction SilentlyContinue |
                 Where-Object { -not (Test-Preserved $_.Name) } |
@@ -387,14 +391,27 @@ try {
                     Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
                 }
         }
-        Start-Sleep -Seconds 1
+        else {
+            New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        }
 
-        Log "静默安装到 $InstallDir"
-        # NSIS 的 /D 必须放最后、不加引号，否则会被当成参数的一部分。
-        # 不指定的话装到当前身份的 %LOCALAPPDATA%\Programs\vcp-chat-desktop，
-        # 服务账户和交互用户的路径不一样，等于同一台机器装出两份。
-        $proc = Start-Process -FilePath $file -ArgumentList "/S", "/D=$InstallDir" -Wait -PassThru
-        if ($proc.ExitCode -ne 0) { throw "安装程序返回 $($proc.ExitCode)" }
+        # 记录安装前的主程序/asar 哈希，用于确认真的换新了
+        $exePath = Join-Path $InstallDir "VCP聊天客户端.exe"
+        $asarPath = Join-Path $InstallDir "resources\app.asar"
+        $before = @{}
+        foreach ($f in @($exePath, $asarPath)) {
+            if (Test-Path $f) { $before[$f] = (Get-Sha256 $f) }
+        }
+
+        Log "复制程序文件到 $InstallDir（跳过数据目录）"
+        $copied = 0
+        foreach ($item in $staged) {
+            if (Test-Preserved $item.Name) { continue }
+            Copy-Item $item.FullName -Destination $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+            $copied++
+        }
+        Log "已复制 $copied 项"
+        if ($copied -eq 0) { throw "没有文件被复制到 $InstallDir" }
 
         # 安装器返回 0 不代表文件真的换成了新的。
         # 实测：客户端正在运行时，exe 和 app.asar 被占用，覆盖失败，
@@ -404,12 +421,6 @@ try {
         #
         # 不能用文件修改时间判断：安装包里的时间戳来自打包时刻，
         # 可能本来就很旧，会造成误报。改用哈希比对安装前后的实际内容。
-        $exePath = Join-Path $InstallDir "VCP聊天客户端.exe"
-        $asarPath = Join-Path $InstallDir "resources\app.asar"
-        $before = @{}
-        foreach ($f in @($exePath, $asarPath)) {
-            if (Test-Path $f) { $before[$f] = (Get-Sha256 $f) }
-        }
         if ($before.Count -gt 0) {
             $unchanged = @()
             foreach ($f in $before.Keys) {
@@ -434,33 +445,30 @@ try {
 
     # ---- 5.5. 建快捷方式 ----
     #
-    # ★ 数据目录必须放在安装目录【外面】。
+    # ---- 5.5. 数据目录：就放在安装目录内，靠 $Preserved 保住 ----
     #
-    # 平铺后安装目录就是 DeployDir，而 NSIS 安装器写入时会清空目标目录 ——
-    # 实测：脚本白名单已经保住了 .deployed-tag / .last-pull.at，
-    # 但 E:\vcpchat\AppData 照样被安装器删了。白名单只管得住脚本自己的
-    # Remove-Item，管不住安装器，所以「把 AppData 加进白名单」这条路走不通。
+    # 客户端默认数据根是 <程序目录>\AppData（main.js 的 APP_DATA_ROOT_IN_PROJECT）。
+    # 安装器会清空整个目标目录，所以上面改成「装到暂存目录再复制过来」，
+    # 复制时跳过 AppData —— 数据从头到尾没被碰过，不需要搬来搬去。
     #
-    # 数据路径早先也试过放安装目录里（app\AppData），一样每次更新都丢 ——
-    # 因为它在安装器的作用范围之内。唯一可靠的做法是移出去。
-    #
-    # 客户端 main.js 原生支持：VCPCHAT_APP_DATA_DIR 有这个值就用它，
-    # 不用 exe 同级的 AppData。所以这里主动设上，而不是像以前那样清掉。
-    $dataRoot = Join-Path (Split-Path $DeployDir -Parent) "vcpchat-data"
+    # 以前这段会把数据搬到 DeployDir 同级的 vcpchat-data 并设
+    # VCPCHAT_APP_DATA_DIR 环境变量，那是绕开安装器的权宜之计，
+    # 现在安装器已经不碰数据了，没必要，也免得同一台机器上两份数据。
+    $dataRoot = Join-Path $InstallDir "AppData"
     if (-not (Test-Path $dataRoot)) {
         New-Item -ItemType Directory -Force -Path $dataRoot | Out-Null
         Log "已创建数据目录 $dataRoot"
     }
 
-    # 旧数据在 <InstallDir>\AppData，第一次升级时搬过去
-    $legacyData = Join-Path $InstallDir "AppData"
-    if (Test-Path $legacyData) {
-        $items = Get-ChildItem $legacyData -Force -ErrorAction SilentlyContinue
+    # 早前把数据搬到过 DeployDir 同级的 vcpchat-data，这里搬回来
+    $oldDataRoot = Join-Path (Split-Path $DeployDir -Parent) "vcpchat-data"
+    if (Test-Path $oldDataRoot) {
+        $items = Get-ChildItem $oldDataRoot -Force -ErrorAction SilentlyContinue
         if ($items) {
-            Log "迁移旧数据 $legacyData -> $dataRoot"
+            Log "把外置数据搬回 $dataRoot"
             foreach ($it in $items) {
                 $dest = Join-Path $dataRoot $it.Name
-                # 目标已存在就不覆盖，避免把新数据盖回旧的
+                # 目标已存在就不覆盖，避免把安装目录里更新的数据盖回旧的
                 if (-not (Test-Path $dest)) {
                     Copy-Item $it.FullName -Destination $dest -Recurse -Force -ErrorAction SilentlyContinue
                 }
@@ -468,11 +476,11 @@ try {
         }
     }
 
-    # 用户级环境变量：从资源管理器/开始菜单启动都能读到
+    # 清掉早前设下的 VCPCHAT_APP_DATA_DIR，否则客户端仍会去读外置目录
     $prevData = [Environment]::GetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", "User")
-    if ($prevData -ne $dataRoot) {
-        [Environment]::SetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", $dataRoot, "User")
-        Log "已设置 VCPCHAT_APP_DATA_DIR = $dataRoot"
+    if ($prevData) {
+        [Environment]::SetEnvironmentVariable("VCPCHAT_APP_DATA_DIR", $null, "User")
+        Log "已清除 VCPCHAT_APP_DATA_DIR（原值 $prevData）"
     }
 
     $appExe = Get-ChildItem $InstallDir -Filter "*.exe" -ErrorAction SilentlyContinue |
