@@ -955,6 +955,37 @@ jobs:
             throw "src/main.js 不存在，打包目录不对"
           }
 
+          # ---- 修 Rust 助手配置路径 ----
+          # 上游 modules/ipc/assistantHandlers.js 用 __dirname 向上两级推导配置目录：
+          #     path.join(__dirname, '..', '..', 'AppData', 'rust-assistant-config.json')
+          # 源码下 __dirname 是 <app>\modules\ipc，向上两级正好是 <app>，没问题；
+          # 但打包进 app.asar 后 __dirname 是 <app>\resources\app.asar\modules\ipc，
+          # 向上两级落在 app.asar 这个【文件】上，fs.ensureDir() 想在文件底下建目录，
+          # 内核直接返回 ENOTDIR —— 表现是设置里保存 Rust 助手配置永远失败，
+          # 跟填什么内容无关。
+          #
+          # 改成向上四级回到 <app>，与开发环境语义一致，
+          # 配置仍落在 <app>\AppData\，和 settings.json 同目录。
+          $ahJs = Join-Path (Get-Location) "modules\ipc\assistantHandlers.js"
+          if (-not (Test-Path $ahJs)) {
+            throw "modules/ipc/assistantHandlers.js 不存在，上游目录结构可能变了"
+          }
+          $ah = Get-Content $ahJs -Raw -Encoding utf8
+          $ahOld = "path.join(__dirname, '..', '..', 'AppData', 'rust-assistant-config.json')"
+          $ahNew = "path.join(__dirname, '../../../../AppData', 'rust-assistant-config.json')"
+          if ($ah.Contains($ahNew)) {
+            Write-Host "Rust 助手配置路径已是修正版"
+          }
+          elseif ($ah.Contains($ahOld)) {
+            $ah = $ah.Replace($ahOld, $ahNew)
+            [System.IO.File]::WriteAllText($ahJs, $ah, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "已修 Rust 助手配置路径: __dirname 向上 2 级 -> 4 级"
+          }
+          else {
+            # 上游改写这段时必须显式失败，别静默发一个带病的包
+            throw "assistantHandlers.js 里没找到预期的 getRustAssistantConfigPath 实现，请检查上游是否已变更"
+          }
+
           npm run build
           if ($LASTEXITCODE -ne 0) { throw "构建失败" }
 
