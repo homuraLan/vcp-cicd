@@ -160,8 +160,12 @@ if (-not $DeployDir) {
 # 一起删掉，下次运行就以为从没部署过。
 $InstallDir = $DeployDir
 
-# 平铺安装时绝对不能删的条目：部署状态、回滚备份、以及构建工作目录（若与本目录重合）
-$Preserved = @('.deployed-tag', '.last-pull.at', '.backup', 'src', 'out', 'logs', 'ci')
+# 平铺安装时绝对不能删的条目。
+#
+# AppData 是用户数据（settings.json / 聊天记录 / 数据库），安装包本身不含它，
+# 但它和安装产物同处一个目录，漏掉就会被当成旧版本残留清掉 —— 实测丢了整份配置。
+# 其余是部署状态、回滚备份和构建工作目录。
+$Preserved = @('.deployed-tag', '.last-pull.at', '.backup', 'AppData', 'src', 'out', 'logs', 'ci')
 
 function Test-Preserved([string]$leaf) {
     return $Preserved -contains $leaf
