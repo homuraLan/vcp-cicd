@@ -111,6 +111,34 @@ try {
         }
     }
 
+    # ---- 修正 Rust 助手配置路径 ----
+    # 上游 modules/ipc/assistantHandlers.js 用 __dirname 向上两级推导配置目录：
+    #     path.join(__dirname, '..', '..', 'AppData', 'rust-assistant-config.json')
+    # 源码目录下 __dirname 是 <app>\modules\ipc，向上两级正好是 <app>，正确；
+    # 但打包进 app.asar 后 __dirname 是 <app>\resources\app.asar\modules\ipc，
+    # 向上两级落在 app.asar 这个【文件】上，fs.ensureDir() 试图在文件底下建目录，
+    # 内核返回 ENOTDIR。表现是设置里保存 Rust 助手配置必然失败，填什么都一样。
+    #
+    # 改为向上四级：<app>\resources\app.asar\modules\ipc -> <app>
+    # 与开发环境语义一致，配置落回 <app>\AppData\，和 settings.json 同目录。
+    $ahPath = Join-Path $Src "modules\ipc\assistantHandlers.js"
+    if (-not (Test-Path $ahPath)) {
+        throw "未找到 modules\ipc\assistantHandlers.js，上游目录结构可能已变更"
+    }
+    $ahText = [System.IO.File]::ReadAllText($ahPath)
+    $ahOld = "path.join(__dirname, '..', '..', 'AppData', 'rust-assistant-config.json')"
+    $ahNew = "path.join(__dirname, '../../../../AppData', 'rust-assistant-config.json')"
+    if ($ahText.Contains($ahNew)) {
+        Log "Rust 助手配置路径已是修正版，跳过"
+    } elseif ($ahText.Contains($ahOld)) {
+        $ahText = $ahText.Replace($ahOld, $ahNew)
+        [System.IO.File]::WriteAllText($ahPath, $ahText, (New-Object System.Text.UTF8Encoding($false)))
+        Log "已修正 Rust 助手配置路径（ENOTDIR）：__dirname 向上 2 级 -> 4 级"
+    } else {
+        # 上游改写过这段就必须显式失败，别静默放过带 bug 的包
+        throw "assistantHandlers.js 中未找到预期的 getRustAssistantConfigPath 实现，请检查上游是否已变更"
+    }
+
     # ---- 构建 Rust 运行时 ----
     Log "构建 Rust 运行时组件"
     & npm run build 2>&1 | Tee-Object -FilePath $Log -Append
