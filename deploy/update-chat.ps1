@@ -153,10 +153,19 @@ if (-not $DeployDir) {
     }
 }
 
-# 程序装到 DeployDir 下的 app 子目录，不要直接铺在 DeployDir 根上。
-# DeployDir 同时还是编译工作目录，里面有 src / out / logs 这些构建产物；
-# 安装版铺在根上会跟它们混在一起，卸载时更会把整个目录连同源码一起删掉。
-$InstallDir = Join-Path $DeployDir "app"
+# 程序直接装在 DeployDir 根上（E:\vcpchat\VCP聊天客户端.exe），不再多套一层 app。
+#
+# 代价是 DeployDir 里同时住着安装产物和部署元数据，所以下面凡是「清空安装目录」
+# 的地方都必须显式跳过 $Preserved —— 否则会把 .deployed-tag / .last-pull.at
+# 一起删掉，下次运行就以为从没部署过。
+$InstallDir = $DeployDir
+
+# 平铺安装时绝对不能删的条目：部署状态、回滚备份、以及构建工作目录（若与本目录重合）
+$Preserved = @('.deployed-tag', '.last-pull.at', '.backup', 'src', 'out', 'logs', 'ci')
+
+function Test-Preserved([string]$leaf) {
+    return $Preserved -contains $leaf
+}
 
 # ---- 0. 到间隔了没有 ----
 # 上游照常编译，这里管的是本机多久去拉一次。
@@ -295,16 +304,19 @@ if ($LASTEXITCODE -eq 0 -and (Test-Path (Join-Path $tmp $sumName))) {
 }
 
 # ---- 4. 备份旧版本，准备回滚 ----
+# InstallDir 与 DeployDir 现在是同一个目录，所以备份时必须排除元数据，
+# 尤其不能用递归把 .backup 自己套进去（会自我复制到爆盘）。
 $backup = Join-Path $DeployDir ".backup"
 if (Test-Path $backup) { Remove-Item $backup -Recurse -Force }
 if (Test-Path $InstallDir) {
-    $existing = Get-ChildItem $InstallDir -ErrorAction SilentlyContinue
+    $existing = Get-ChildItem $InstallDir -ErrorAction SilentlyContinue |
+                Where-Object { -not (Test-Preserved $_.Name) }
     if ($existing) {
         New-Item -ItemType Directory -Force -Path $backup | Out-Null
         foreach ($item in $existing) {
             Copy-Item $item.FullName -Destination $backup -Recurse -Force -ErrorAction SilentlyContinue
         }
-        Log "已备份旧版本"
+        Log "已备份旧版本（$($existing.Count) 项）"
     }
 }
 
@@ -328,8 +340,19 @@ try {
             }
             Start-Sleep -Seconds 2
         }
-        # 兜底只删安装目录，绝不能碰 DeployDir 本身 —— 那里还有 src / out / logs
-        if (Test-Path $InstallDir) { Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue }
+        # 兜底清理：只删安装产物，保留部署元数据。
+        #
+        # 这里以前是 Remove-Item $InstallDir -Recurse —— 那时 InstallDir 是
+        # DeployDir\app，整删安全。现在 InstallDir 就是 DeployDir 本身，
+        # 整删会把 .deployed-tag / .last-pull.at / .backup 一起干掉，
+        # 所以改成逐项删除并跳过 $Preserved。
+        if (Test-Path $InstallDir) {
+            Get-ChildItem $InstallDir -Force -ErrorAction SilentlyContinue |
+                Where-Object { -not (Test-Preserved $_.Name) } |
+                ForEach-Object {
+                    Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                }
+        }
         Start-Sleep -Seconds 1
 
         Log "静默安装到 $InstallDir"
