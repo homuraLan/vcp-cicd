@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""给上游 Dockerfile 补上插件原生二进制编译。
+"""给上游 Dockerfile 补上插件编译、TriviumDB 运行库和原生功能验证。
 
 上游只编译了 rust-vexus-lite，插件里带 Rust 源码的三个（CodeSearcher、
 DailyNoteSearcher、PaperReader）靠仓库里放的预编译二进制。预编译不全会导致
@@ -10,13 +10,25 @@ aarch64 版本，x86_64 服务器上用不了。
 镜像里，容器和导出的 Linux 二进制包内容一致。
 
 用法：python3 patch-dockerfile.py <Dockerfile 路径>
-脚本是幂等的，已经打过就跳过。
+脚本是幂等的；旧插件编译补丁也会继续补齐新的运行库和验证步骤。
 """
 
+from pathlib import Path
 import re
 import sys
 
 MARKER = "# >>> plugin-native-build"
+SMOKE_MARKER = "# >>> triviumdb-runtime-smoke"
+SMOKE_SOURCE = Path(__file__).with_name("smoke-triviumdb.cjs")
+SMOKE_NAME = "vcp-ci-smoke-triviumdb.cjs"
+
+SMOKE_BLOCK = f"""# >>> triviumdb-runtime-smoke
+# TriviumDB ships a GNU/glibc addon. Alpine's gcompat supplies its runtime ABI.
+# Exercise the final runtime image: loading alone does not prove persisted search works.
+COPY --from=build /usr/src/app/{SMOKE_NAME} ./{SMOKE_NAME}
+RUN node ./{SMOKE_NAME}
+# <<< triviumdb-runtime-smoke
+"""
 
 BLOCK = """# >>> plugin-native-build
 # 插件里的 Rust 子项目需要现场编译。上游只在仓库里放了部分平台的预编译
@@ -57,36 +69,70 @@ RUN echo ">>> Building plugin native binaries..." && \\
 """
 
 
+def patch_dockerfile(text: str) -> str:
+    """Fail closed when the upstream stages change instead of patching the wrong image."""
+    text = text.replace("\r\n", "\n")
+    stages = re.findall(r"(?m)^FROM\s+([^\n]+)", text)
+    if len(stages) != 2 or not all(re.match(r"node:[^\s]*alpine(?:\s|$)", stage) for stage in stages):
+        raise ValueError("Expected two Node Alpine stages; review native runtime dependencies")
+
+    # Keep build/runtime ABIs consistent. This also permits an upstream apk block that
+    # already contains gcompat without adding a second copy of the package.
+    lines = text.splitlines(keepends=True)
+    apk_lines = [i for i, line in enumerate(lines) if line.startswith("RUN apk add --no-cache")]
+    if len(apk_lines) != 2:
+        raise ValueError("Expected one apk dependency block in each stage")
+    for index in reversed(apk_lines):
+        end = index
+        while lines[end].rstrip().endswith("\\"):
+            end += 1
+            if end >= len(lines):
+                raise ValueError("Unterminated apk dependency block")
+        block = "".join(lines[index:end + 1])
+        if not re.search(r"\bgcompat\b", block):
+            if not lines[index].rstrip().endswith("\\"):
+                raise ValueError("Expected a multiline apk dependency block")
+            lines.insert(index + 1, "  gcompat \\\n")
+    text = "".join(lines)
+
+    if MARKER not in text:
+        anchor = "\n# 查找所有插件目录下的 requirements.txt"
+        if anchor not in text:
+            raise ValueError("找不到插件编译插入点，Dockerfile 结构可能变了")
+        text = text.replace(anchor, "\n" + BLOCK + anchor, 1)
+
+    if SMOKE_MARKER not in text:
+        # Run after production has all native modules, before PM2 starts anything.
+        anchor = "COPY --from=build /usr/src/app/AdminPanel-Vue/dist ./AdminPanel-Vue/dist\n"
+        if text.count(anchor) != 1:
+            raise ValueError("找不到最终运行阶段验证插入点，Dockerfile 结构可能变了")
+        text = text.replace(anchor, anchor + "\n" + SMOKE_BLOCK, 1)
+    return text
+
+
 def main() -> int:
-    path = sys.argv[1] if len(sys.argv) > 1 else "Dockerfile"
-    with open(path, "rb") as fh:
-        raw = fh.read()
+    path = Path(sys.argv[1] if len(sys.argv) > 1 else "Dockerfile")
+    raw = path.read_bytes()
 
     # 统一成 LF 再处理，插入的段落一律用 LF 写出。
     # 上游文件是 CRLF，但 CRLF 会把 \r 留在续行符 \ 后面，Docker 拼出来的
     # RUN 命令里就混进回车，shell 解析会出错（实测量出来的产物对不上）。
     had_crlf = b"\r\n" in raw
-    text = raw.decode("utf-8").replace("\r\n", "\n")
-
-    if MARKER in text:
-        print("已打过补丁，跳过")
-        return 0
-
-    # 插在 AdminPanel-Vue 构建之后、插件依赖安装之前
-    anchor = "\n# 查找所有插件目录下的 requirements.txt"
-    if anchor not in text:
-        print("::error::找不到插入点，Dockerfile 结构可能变了")
+    try:
+        text = patch_dockerfile(raw.decode("utf-8"))
+        smoke = SMOKE_SOURCE.read_bytes()
+    except (ValueError, OSError) as exc:
+        print(f"::error::{exc}")
         return 1
-
-    text = text.replace(anchor, "\n" + BLOCK + anchor, 1)
 
     # 整个文件写成 LF：Docker 两种都能读，混用反而容易出上面的续行问题
     if had_crlf:
         print("原文件是 CRLF，已转为 LF 以避免续行符失效")
-    with open(path, "wb") as fh:
-        fh.write(text.encode("utf-8"))
-
-    print("已补入插件编译段")
+    # The caller patches an upstream checkout, not this CI repository. Stage the
+    # probe beside Dockerfile so upstream COPY . . includes the reviewed script.
+    path.with_name(SMOKE_NAME).write_bytes(smoke.replace(b"\r\n", b"\n"))
+    path.write_bytes(text.encode("utf-8"))
+    print("已补齐插件编译、gcompat 运行库和 TriviumDB 持久化检索验证")
     return 0
 
 
