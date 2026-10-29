@@ -1,26 +1,7 @@
 #!/usr/bin/env bash
-# VCPToolBox 服务端自动更新
-#
-# 由 GitHub Actions 在构建完成后调用，也可以由 runner 定时轮询触发。
-# 两种入口都走这个脚本，保证行为一致。
-#
-# 设计要点：
-#   - 幂等：目标版本已在跑就直接退出，不会重启服务
-#   - 可回滚：所有改动前先备份 override 与源码提交号
-#   - 保数据：只更新代码，不碰 config.env 和 VectorStore 卷
-#   - 健康检查：起不来自动回滚到旧镜像
-#
-# 环境变量：
-#   DEPLOY_DIR     部署目录（必填）
-#   TARGET_IMAGE   目标镜像，如 homuralan/vcptoolbox:add5dbb5（必填）
-#   TARGET_SHA     目标上游提交（可选，用于记录）
-#   TARGET_TAG     目标发布标签（可选，用于算拉取间隔）
-#   HEALTH_URL     健康检查地址（可选）
-#   INTERVAL_H     本机多久拉一次，小时；0 表示不自动拉（可选，默认 168 = 一周）
-#   FORCE          设为 1 忽略间隔，立刻拉（手动触发时用）
-
-set -euo pipefail
-
+# Image code stays in the image; production configuration and data stay on the host.
+# See deploy/README.md for path options and rollback behavior.
+set -Eeuo pipefail
 DEPLOY_DIR="${DEPLOY_DIR:?必须指定 DEPLOY_DIR}"
 TARGET_IMAGE="${TARGET_IMAGE:?必须指定 TARGET_IMAGE}"
 TARGET_SHA="${TARGET_SHA:-}"
@@ -28,206 +9,153 @@ TARGET_TAG="${TARGET_TAG:-}"
 HEALTH_URL="${HEALTH_URL:-}"
 INTERVAL_H="${INTERVAL_H:-168}"
 FORCE="${FORCE:-0}"
-
+HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-40}"
+HEALTH_DELAY_SECONDS="${HEALTH_DELAY_SECONDS:-3}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export DEPLOY_DIR TARGET_IMAGE
 log() { echo "[$(date '+%F %T')] $*"; }
-
-cd "$DEPLOY_DIR" || { echo "部署目录不存在: $DEPLOY_DIR"; exit 1; }
-
-OVER_BACKUP="$DEPLOY_DIR/.override.backup"
-PREV_IMAGE=""
+[[ "$TARGET_IMAGE" =~ ^[[:alnum:]][[:alnum:]_.:/@-]*$ ]] || { echo "镜像引用格式无效"; exit 1; }
+cd "$DEPLOY_DIR"
 POLICY_STAMP="$DEPLOY_DIR/.last-pull.at"
-
-# ---- 0. 到间隔了没有 ----
-# 上游照常编译，这里管的是本机多久去拉一次。
-# 时间戳落在部署目录里，跨次运行留得住；托管 runner 上没有这个目录。
-if [ "$FORCE" != "1" ] && [ "$INTERVAL_H" != "0" ] && [ -f "$POLICY_STAMP" ]; then
-  LAST_AT=$(cat "$POLICY_STAMP" 2>/dev/null || echo 0)
-  NOW_AT=$(date -u +%s)
-  GAP=$(( NOW_AT - LAST_AT ))
-  LIMIT=$(( INTERVAL_H * 3600 ))
-  if [ "$GAP" -lt "$LIMIT" ]; then
-    log "距上次拉取 ${GAP}s，未到 ${LIMIT}s（间隔 ${INTERVAL_H}h），本次跳过"
-    exit 0
+if [ "$FORCE" != "1" ]; then
+  [ "$INTERVAL_H" != "0" ] || { log "自动更新已关闭"; exit 0; }
+  if [ -f "$POLICY_STAMP" ]; then
+    LAST_AT=$(cat "$POLICY_STAMP")
+    if (( $(date -u +%s) - LAST_AT < INTERVAL_H * 3600 )); then
+      log "未到更新间隔，本次跳过"
+      exit 0
+    fi
   fi
 fi
 
-# ---- 1. 已经在跑目标版本就不用动 ----
+# Snapshot the actual running image before pull: an upstream SHA tag can be rebuilt.
+mkdir -p .deploy-backup
+BACKUP_DIR=$(mktemp -d "$DEPLOY_DIR/.deploy-backup/server-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+HAD_OVERRIDE=false
 if [ -f docker-compose.override.yml ]; then
-  PREV_IMAGE=$(grep -E '^\s+image:' docker-compose.override.yml | head -1 | awk '{print $2}')
+  cp -p docker-compose.override.yml "$BACKUP_DIR/docker-compose.override.yml"
+  HAD_OVERRIDE=true
 fi
-
-if [ "$PREV_IMAGE" = "$TARGET_IMAGE" ]; then
-  log "已在运行 $TARGET_IMAGE，无需更新"
-  # 版本没变也刷新时间戳，免得每隔一次定时就跑一遍检查
-  date -u +%s > "$POLICY_STAMP" 2>/dev/null || true
+PREV_IMAGE_ID=""
+PREV_IMAGE=""
+PREV_CONTAINER=$(docker compose ps -q app)
+if [ -n "$PREV_CONTAINER" ]; then
+  PREV_IMAGE_ID=$(docker inspect --format '{{.Image}}' "$PREV_CONTAINER")
+  PREV_IMAGE=$(docker inspect --format '{{.Config.Image}}' "$PREV_CONTAINER")
+  ROLLBACK_IMAGE="vcptoolbox-deploy-rollback:$(basename "$BACKUP_DIR")"
+  docker image tag "$PREV_IMAGE_ID" "$ROLLBACK_IMAGE"
+  printf '%s\n' "$PREV_IMAGE_ID" > "$BACKUP_DIR/image-id"
+  printf '%s\n' "$ROLLBACK_IMAGE" > "$BACKUP_DIR/image-reference"
+fi
+NEXT_OVERRIDE="$BACKUP_DIR/next-override.yml"
+python3 "$SCRIPT_DIR/prepare-server-compose.py" "$SCRIPT_DIR/docker-compose.deploy.yml" "$NEXT_OVERRIDE"
+docker compose -f docker-compose.yml -f "$NEXT_OVERRIDE" config --quiet
+log "拉取镜像 $TARGET_IMAGE"
+docker pull "$TARGET_IMAGE"
+TARGET_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$TARGET_IMAGE")
+if [ "$FORCE" != "1" ] && [ -n "$PREV_IMAGE_ID" ] && [ "$PREV_IMAGE_ID" = "$TARGET_IMAGE_ID" ] \
+    && [ "$HAD_OVERRIDE" = true ] && cmp -s "$NEXT_OVERRIDE" docker-compose.override.yml; then
+  log "运行镜像与部署配置均未改变，无需重启"
+  date -u +%s > "$POLICY_STAMP"
   exit 0
 fi
-
-log "当前镜像: ${PREV_IMAGE:-<未设置>}"
-log "目标镜像: $TARGET_IMAGE"
-
-# ---- 2. 拉取新镜像 ----
-log "拉取镜像"
-if ! docker pull "$TARGET_IMAGE"; then
-  echo "镜像拉取失败，保留当前版本不动"
-  exit 1
-fi
-
-# ---- 3. 备份当前状态，便于回滚 ----
-if [ -f docker-compose.override.yml ]; then
-  cp docker-compose.override.yml "$OVER_BACKUP"
-  log "已备份 override 配置"
-fi
-
-PREV_COMMIT=""
-if [ -d .git ]; then
-  PREV_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "")
-fi
-
 rollback() {
-  log "!!! 更新失败，开始回滚"
-  if [ -n "$PREV_IMAGE" ] && [ -f "$OVER_BACKUP" ]; then
-    cp "$OVER_BACKUP" docker-compose.override.yml
-    docker compose up -d --remove-orphans || true
-    log "已回滚到 ${PREV_IMAGE}"
+  trap - ERR INT TERM
+  set +e
+  log "更新失败，恢复旧部署；备份保留于 $BACKUP_DIR"
+  if [ "$HAD_OVERRIDE" = true ]; then
+    cp -p "$BACKUP_DIR/docker-compose.override.yml" docker-compose.override.yml
+  else
+    rm -f docker-compose.override.yml
   fi
-  if [ -n "$PREV_COMMIT" ] && [ -d .git ]; then
-    git reset --hard "$PREV_COMMIT" >/dev/null 2>&1 || true
-    log "已回滚源码到 ${PREV_COMMIT:0:8}"
+  if [ -n "$PREV_IMAGE_ID" ]; then
+    # Restore mutable tags so a later ordinary compose up also resolves the old image.
+    if [[ "$PREV_IMAGE" != *@* && "$PREV_IMAGE" != sha256:* ]]; then
+      if ! docker image tag "$PREV_IMAGE_ID" "$PREV_IMAGE"; then
+        log "旧镜像标签恢复失败，请使用备份中的 image-reference 手工恢复"
+        exit 1
+      fi
+    fi
+    if docker compose up -d --force-recreate --pull never; then
+      local restored_container restored_id
+      restored_container=$(docker compose ps -q app)
+      restored_id=$(docker inspect --format '{{.Image}}' "$restored_container")
+      if [ "$restored_id" = "$PREV_IMAGE_ID" ]; then
+        log "已恢复旧镜像 $PREV_IMAGE_ID"
+      else
+        log "回滚镜像核验失败，请检查服务；旧镜像引用保留于备份目录"
+      fi
+    else
+      log "旧服务启动失败，请检查服务；旧镜像引用保留于备份目录"
+    fi
+  else
+    log "此前没有 app 容器，已恢复原配置，请检查首次部署失败原因"
   fi
   exit 1
 }
-
-# ---- 4. 更新源码 ----
-# 宿主机源码整目录挂载进容器，会覆盖镜像里的代码，所以必须同步更新
-if [ -d .git ]; then
-  log "更新源码"
-
-  # 部署目录一般属于 root，而 runner 用别的账户跑，git 会因为
-  # 「dubious ownership」拒绝操作。这个目录是我们自己指定的，加白名单。
-  # 只在当前命令生效，不改 runner 的全局 git 配置。
-  git -c safe.directory="$PWD" status >/dev/null 2>&1 || true
-  export GIT_CONFIG_COUNT=1
-  export GIT_CONFIG_KEY_0=safe.directory
-  export GIT_CONFIG_VALUE_0="$PWD"
-
-  BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
-  [ "$BRANCH" = "HEAD" ] && BRANCH=main
-
-  # 上游会 force push 改写历史，--ff-only 必然失败，所以直接对齐远端。
-  # 注意别写成 `git fetch ... | tail`：管道会让 $? 变成 tail 的退出码，
-  # 永远看不到 fetch 真失败。
-  FETCH_LOG=$(mktemp)
-  if ! git fetch --depth 1 origin "$BRANCH" >"$FETCH_LOG" 2>&1; then
-    tail -3 "$FETCH_LOG"
-    rm -f "$FETCH_LOG"
-    log "拉取失败，保留当前源码"
-    exit 1
-  fi
-  rm -f "$FETCH_LOG"
-
-  # reset 会覆盖本地对跟踪文件的修改。先留一份，出问题能找回来
-  if ! git diff --quiet 2>/dev/null; then
-    CHANGED=$(git diff --name-only 2>/dev/null | tr '\n' ' ')
-    log "本地修改过的跟踪文件: $CHANGED"
-    mkdir -p .deploy-backup
-    for f in $CHANGED; do
-      [ -f "$f" ] && cp "$f" ".deploy-backup/$(echo "$f" | tr '/' '_').$(date +%s)" 2>/dev/null || true
-    done
-    log "已备份到 .deploy-backup"
-  fi
-
-  if ! git reset --hard "origin/$BRANCH" >/dev/null 2>&1; then
-    log "重置失败（可能是浅克隆缺对象），尝试补全后重试"
-    git fetch --unshallow origin "$BRANCH" >/dev/null 2>&1 || true
-    if ! git reset --hard "origin/$BRANCH" >/dev/null 2>&1; then
-      rollback
+trap rollback ERR INT TERM
+# No git reset/clean, native-module deletion, or replacement of production data.
+cp "$NEXT_OVERRIDE" docker-compose.override.yml
+log "重建服务（旧镜像与配置保留于 $BACKUP_DIR）"
+docker compose up -d --force-recreate --pull never
+runtime_ready() {
+  docker compose exec -T app node - <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const cfg = { ...require('dotenv').parse(fs.readFileSync('/usr/src/app/config.env')), ...process.env };
+const mainPort = parseInt(cfg.PORT, 10) || 3000;
+const root = path.resolve(cfg.TDB_KNOWLEDGE_ROOT_PATH || '/usr/src/app/knowledge');
+const store = path.resolve(cfg.TDB_KNOWLEDGE_STORE_PATH || '/usr/src/app/VectorStoreTDB');
+(async () => {
+  if (!fs.statSync(root).isDirectory() || !fs.statSync(store).isDirectory()) throw new Error('directory');
+  fs.accessSync(root, fs.constants.R_OK);
+  fs.accessSync(store, fs.constants.R_OK | fs.constants.W_OK);
+  JSON.parse(fs.readFileSync('/usr/src/app/rag_params.json', 'utf8'));
+  const statuses = await Promise.all([mainPort, mainPort + 1].map(async port => {
+    const response = await fetch(`http://127.0.0.1:${port}/`, {
+      redirect: 'manual', signal: AbortSignal.timeout(4000)
+    });
+    return [200, 301, 302, 307, 308, 401, 403].includes(response.status);
+  }));
+  if (!statuses.every(Boolean)) throw new Error('listener');
+  if (String(cfg.TDB_KNOWLEDGE_ENABLED || 'false').toLowerCase() === 'true') {
+    if (!cfg.AdminUsername || !cfg.AdminPassword) throw new Error('admin-auth-required');
+    const response = await fetch(`http://127.0.0.1:${mainPort}/admin_api/system-monitor/memory/profile`, {
+      headers: { Authorization: 'Basic ' + Buffer.from(`${cfg.AdminUsername}:${cfg.AdminPassword}`).toString('base64') },
+      signal: AbortSignal.timeout(4000)
+    });
+    if (!response.ok) throw new Error('profile');
+    const body = await response.json();
+    const cold = body.profile?.tdbKnowledge;
+    if (!cold?.enabled || !cold.initialized || !cold.metaDb?.open) throw new Error('cold-knowledge');
+    if (cfg.TDB_KNOWLEDGE_DIMENSION && Number(cold.dimension) !== Number(cfg.TDB_KNOWLEDGE_DIMENSION)) {
+      throw new Error('cold-knowledge-dimension');
+    }
+  }
+})().catch(() => { process.exitCode = 1; });
+NODE
+}
+log "等待主服务、管理服务与知识库挂载就绪"
+ok=false
+for ((i=1; i<=HEALTH_ATTEMPTS; i++)); do
+  if runtime_ready; then
+    if [ -z "$HEALTH_URL" ]; then
+      ok=true
+    else
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL" 2>/dev/null || true)
+      case "$code" in 200|301|302|307|308|401|403) ok=true ;; esac
     fi
   fi
-
-  log "源码已更新到 $(git rev-parse --short HEAD)（$(git log -1 --format=%s | cut -c1-50)）"
-
-  # rust-vexus-lite 的原生模块跟 Node 版本强绑定，必须用镜像里编好的那份。
-  # 宿主目录里的预编译产物会遮住镜像的（见下面 volumes 说明），所以清掉。
-  if [ -d rust-vexus-lite ]; then
-    NODES=$(ls rust-vexus-lite/*.node 2>/dev/null | wc -l)
-    if [ "$NODES" -gt 0 ]; then
-      mkdir -p .node-backup
-      cp -a rust-vexus-lite/*.node .node-backup/ 2>/dev/null || true
-      rm -f rust-vexus-lite/*.node
-      log "已清理 $NODES 个宿主原生模块，改用镜像内的版本"
-    fi
-  fi
-fi
-
-# ---- 5. 切换镜像并重建 ----
-# 上游的 docker-compose.yml 是给本地开发用的，有三个挂载会毁掉镜像里的产物：
-#   .:/usr/src/app             宿主源码覆盖镜像代码
-#   /usr/src/app/pydeps        匿名卷遮住镜像里装好的 python 依赖
-#   /usr/src/app/node_modules  匿名卷遮住镜像里的 node_modules
-# 所以这里用 !override 整段替换挂载，只留配置和数据。
-log "写入部署配置"
-cat > docker-compose.override.yml <<EOF
-services:
-  app:
-    image: ${TARGET_IMAGE}
-    volumes: !override
-      - ./config.env:/usr/src/app/config.env
-      - ./TVStxt:/usr/src/app/TVStxt
-      - ./ToolConfigs:/usr/src/app/ToolConfigs
-      - ./Plugin/UserAuth:/usr/src/app/Plugin/UserAuth
-      - vcp_vectorstore:/usr/src/app/VectorStore
-      - ./dailynote:/usr/src/app/dailynote
-      - ./Plugin/VCPLog/log:/usr/src/app/Plugin/VCPLog/log
-EOF
-
-log "重启服务"
-if ! docker compose up -d --force-recreate --remove-orphans; then
+  [ "$ok" != true ] || break
+  sleep "$HEALTH_DELAY_SECONDS"
+done
+if [ "$ok" != true ]; then
+  log "健康检查未通过"
   rollback
 fi
-
-# ---- 6. 健康检查 ----
-# 6005 是主服务，对裸 GET 不回状态码；6006 会返回 302，更适合探活。
-# 任何一个端口有响应就算起来了。
-if [ -n "$HEALTH_URL" ]; then
-  # 主服务对裸 GET 可能不回状态码，所以额外探测 6006
-  HOSTPORT=$(echo "$HEALTH_URL" | sed -E 's#^https?://([^/]+).*#\1#')
-  HOST=$(echo "$HOSTPORT" | sed -E 's#:[0-9]+$##')
-  ALT_URL="http://${HOST}:6006/"
-
-  log "等待服务就绪（$HEALTH_URL）"
-  # 先给容器几秒起来，省得第一轮全是连接拒绝
-  sleep 5
-  ok=false
-  code=""
-  for i in $(seq 1 40); do
-    for u in "$HEALTH_URL" "$ALT_URL"; do
-      # 容器刚起时连接会被拒（curl 退出码 7），set -e 下必须兜住，
-      # 否则整个脚本在这里直接死掉，看不出是「还没起来」还是「起不来」
-      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$u" 2>/dev/null || true)
-      case "$code" in
-        200|301|302|307|401|403) ok=true; break 2 ;;
-      esac
-    done
-    sleep 3
-  done
-  if [ "$ok" != "true" ]; then
-    log "健康检查未通过（最后状态码 ${code:-无响应}）"
-    rollback
-  fi
-  log "健康检查通过（$code）"
-fi
-
-rm -f "$OVER_BACKUP"
-log "更新完成: $TARGET_IMAGE"
-if [ -n "$TARGET_SHA" ]; then
-  echo "$TARGET_SHA" > .deployed-sha
-  log "记录提交: ${TARGET_SHA:0:8}"
-fi
-# 记下这次拉取时间，下次按间隔判断是否该再拉
-date -u +%s > "$POLICY_STAMP" 2>/dev/null || true
-if [ -n "$TARGET_TAG" ]; then
-  echo "$TARGET_TAG" > .deployed-tag
-fi
-
+trap - ERR INT TERM
+if [ -n "$TARGET_SHA" ]; then printf '%s\n' "$TARGET_SHA" > .deployed-sha; fi
+if [ -n "$TARGET_TAG" ]; then printf '%s\n' "$TARGET_TAG" > .deployed-tag; fi
+date -u +%s > "$POLICY_STAMP"
+log "更新完成: $TARGET_IMAGE ($TARGET_IMAGE_ID)"
 docker compose ps

@@ -129,6 +129,11 @@ jobs:
         shell: bash
         env:
           DEPLOY_DIR: ${{ vars.VCP_SERVER_DIR }}
+          KNOWLEDGE_SOURCE_DIR: ${{ vars.VCP_KNOWLEDGE_SOURCE_DIR }}
+          TDB_STORE_DIR: ${{ vars.VCP_TDB_STORE_DIR }}
+          RAG_PARAMS_FILE: ${{ vars.VCP_RAG_PARAMS_FILE }}
+          TDB_KNOWLEDGE_ROOT_PATH: ${{ vars.VCP_TDB_KNOWLEDGE_ROOT_PATH }}
+          TDB_KNOWLEDGE_STORE_PATH: ${{ vars.VCP_TDB_KNOWLEDGE_STORE_PATH }}
           TARGET_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/vcptoolbox:${{ needs.check.outputs.backend_sha }}
           TARGET_SHA: ${{ needs.check.outputs.backend_sha }}
           TARGET_TAG: ${{ needs.check.outputs.backend_tag }}

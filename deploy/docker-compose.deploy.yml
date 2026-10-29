@@ -1,25 +1,31 @@
-# 部署用的 compose，覆盖上游 docker-compose.yml
-#
-# 上游那份是为「本地开发」写的，有三个挂载会毁掉镜像里的编译产物：
-#   - .:/usr/src/app             宿主源码覆盖镜像代码
-#   - /usr/src/app/pydeps        匿名卷遮住镜像里装好的 python 依赖
-#   - /usr/src/app/node_modules  匿名卷遮住镜像里的 node_modules
-# 结果就是 rust-vexus-lite 的原生模块用不上，报 ABI unavailable 起不来。
-#
-# 这里挂载列表整体重置成部署需要的样子：代码和依赖都用镜像里的，
-# 只把「配置」和「数据」留在外面，保证可迁移、可备份。
-
+# Rendered by prepare-server-compose.py; code/dependencies stay inside the image.
+# !override requires Compose 2.24.4+; !reset would discard these mounts.
 services:
   app:
     image: __IMAGE__
-    # !reset 让挂载列表整段替换，而不是跟上游的合并
-    volumes: !reset
-      # 用户配置
+    environment:
+      TDB_KNOWLEDGE_ROOT_PATH: __KNOWLEDGE_TARGET__
+      TDB_KNOWLEDGE_STORE_PATH: __TDB_STORE_TARGET__
+    volumes: !override
       - ./config.env:/usr/src/app/config.env
       - ./TVStxt:/usr/src/app/TVStxt
       - ./ToolConfigs:/usr/src/app/ToolConfigs
       - ./Plugin/UserAuth:/usr/src/app/Plugin/UserAuth
-      # 知识库与向量数据，必须持久化
       - vcp_vectorstore:/usr/src/app/VectorStore
       - ./dailynote:/usr/src/app/dailynote
       - ./Plugin/VCPLog/log:/usr/src/app/Plugin/VCPLog/log
+      - type: bind
+        source: __KNOWLEDGE_SOURCE__
+        target: __KNOWLEDGE_TARGET__
+        bind:
+          create_host_path: false
+      - type: bind
+        source: __TDB_STORE_SOURCE__
+        target: __TDB_STORE_TARGET__
+        bind:
+          create_host_path: false
+      - type: bind
+        source: __RAG_PARAMS_SOURCE__
+        target: /usr/src/app/rag_params.json
+        bind:
+          create_host_path: false

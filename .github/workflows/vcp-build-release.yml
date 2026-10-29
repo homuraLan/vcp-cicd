@@ -64,6 +64,7 @@ jobs:
       mobile: ${{ steps.check.outputs.mobile }}
       desktop: ${{ steps.check.outputs.desktop }}
       backend_sha: ${{ steps.check.outputs.backend_sha }}
+      backend_recipe: ${{ steps.check.outputs.backend_recipe }}
       mobile_sha: ${{ steps.check.outputs.mobile_sha }}
       desktop_sha: ${{ steps.check.outputs.desktop_sha }}
       desktop_recipe: ${{ steps.check.outputs.desktop_recipe }}
@@ -111,6 +112,9 @@ jobs:
           # v2: 注入数据目录补丁（安装版启动无窗口）+ 写入日期版本号
           # v4: package.json 保持三段 SemVer，Windows 文件版本另用 build.win.fileVersion 写四段
           RECIPE_VERSION=v5
+          # Runtime dependencies and native smoke tests can change without an
+          # upstream commit. Rebuild the backend when this recipe changes.
+          BACKEND_RECIPE_VERSION=cold-knowledge-v1
 
           # 读取上次记录的提交，没有就当空
           prev() {
@@ -157,6 +161,18 @@ jobs:
               continue
             fi
 
+            if [ "$name" = "backend" ]; then
+              echo "backend_recipe=$BACKEND_RECIPE_VERSION" >> "$GITHUB_OUTPUT"
+              old_backend_recipe=$(cat state/backend.recipe 2>/dev/null || true)
+              if [ "$cur" = "$old" ] && [ "$old_backend_recipe" != "$BACKEND_RECIPE_VERSION" ]; then
+                echo "$name=build (runtime recipe ${old_backend_recipe:-none} -> $BACKEND_RECIPE_VERSION)"
+                echo "backend=true" >> "$GITHUB_OUTPUT"
+                echo "backend_sha=$cur" >> "$GITHUB_OUTPUT"
+                ANY=true
+                continue
+              fi
+            fi
+
             if [ "$cur" = "$old" ]; then
               # 上游没变，但我们的打包配方可能变了。
               # 桌面端要注入数据目录补丁、写版本号，这些一旦改动，
@@ -178,7 +194,9 @@ jobs:
             else
               echo "$name=build（${old:0:8} → ${cur:0:8}）"
               echo "$name=true" >> "$GITHUB_OUTPUT"
-              echo "${name}_recipe=$RECIPE_VERSION" >> "$GITHUB_OUTPUT"
+              if [ "$name" = "desktop" ]; then
+                echo "${name}_recipe=$RECIPE_VERSION" >> "$GITHUB_OUTPUT"
+              fi
               ANY=true
             fi
             echo "${name}_sha=$cur" >> "$GITHUB_OUTPUT"
@@ -403,9 +421,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: lioensky/VCPToolBox
-          ref: ${{ inputs.sha || 'main' }}
+          ref: ${{ needs.detect.outputs.backend_sha }}
           path: src
           fetch-depth: 1
+
+      - name: 验证服务端构建与部署脚本
+        working-directory: ci
+        run: |
+          python3 -m unittest discover -s tests -v
+          bash -n deploy/update-server.sh
+          node --check scripts/smoke-triviumdb.cjs
 
       - name: 记录版本
         id: meta
@@ -1301,6 +1326,7 @@ jobs:
 
           # 只记录本次真正构建成功的组件
           [ "${{ needs.backend.result }}" = "success" ] && echo "${{ needs.detect.outputs.backend_sha }}" > backend.sha || true
+          [ "${{ needs.backend.result }}" = "success" ] && echo "${{ needs.detect.outputs.backend_recipe }}" > backend.recipe || true
           [ "${{ needs.mobile.result }}" = "success" ] && echo "${{ needs.detect.outputs.mobile_sha }}" > mobile.sha || true
           [ "${{ needs.desktop.result }}" = "success" ] && echo "${{ needs.detect.outputs.desktop_sha }}" > desktop.sha || true
           # 记下这次用的打包配方，下次据此判断「上游没动但打包方式变了」要不要重打
@@ -1349,6 +1375,11 @@ jobs:
         shell: bash
         env:
           DEPLOY_DIR: ${{ vars.VCP_SERVER_DIR }}
+          KNOWLEDGE_SOURCE_DIR: ${{ vars.VCP_KNOWLEDGE_SOURCE_DIR }}
+          TDB_STORE_DIR: ${{ vars.VCP_TDB_STORE_DIR }}
+          RAG_PARAMS_FILE: ${{ vars.VCP_RAG_PARAMS_FILE }}
+          TDB_KNOWLEDGE_ROOT_PATH: ${{ vars.VCP_TDB_KNOWLEDGE_ROOT_PATH }}
+          TDB_KNOWLEDGE_STORE_PATH: ${{ vars.VCP_TDB_KNOWLEDGE_STORE_PATH }}
           # 镜像 tag 用短 hash：推送时打的是 8 位，这里传完整 SHA 会拉不到。
           FULL_SHA: ${{ needs.detect.outputs.backend_sha }}
           DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
