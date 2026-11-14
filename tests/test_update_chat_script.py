@@ -16,11 +16,18 @@ class UpdateChatScriptTests(unittest.TestCase):
 
     def test_user_data_is_moved_aside_before_anything_deletes_the_install(self):
         # The packaged client keeps chats and settings in <install>\AppData.
-        stash = self.text.index("Move-Item -LiteralPath $dataDir -Destination $dataKeep")
+        stash = self.text.index("[System.IO.Directory]::Move($dataDir, $dataKeep)")
         uninstall = self.text.index("$uninst = Get-ChildItem $InstallDir")
         wipe = self.text.index("if (Test-Path $InstallDir) { Remove-Item $InstallDir")
         self.assertLess(stash, uninstall)
         self.assertLess(stash, wipe)
+
+    def test_user_data_moves_are_atomic(self):
+        # Move-Item is not atomic for folders: when the rename is blocked it creates the
+        # destination and moves children one by one (seen on HOMURAR900P, 2026-11-15).
+        code = "\n".join(l for l in self.text.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn("Move-Item -LiteralPath $dataDir", code)
+        self.assertNotIn("Move-Item -LiteralPath $dataKeep", code)
 
     def test_user_data_is_restored_after_install_and_on_failure(self):
         install_done = self.text.index('Log "解压完成"')
