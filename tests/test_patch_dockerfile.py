@@ -25,6 +25,13 @@ class DockerfilePatchTests(unittest.TestCase):
         self.assertIn('COPY --from=build /usr/src/app/vcp-ci-smoke-triviumdb.cjs', runtime)
         self.assertIn(patch.MARKER, build)
 
+    def test_musl_loader_name_aliases_gnu_addon_before_smoke(self):
+        runtime = patch.patch_dockerfile(UPSTREAM).split('FROM node:20-alpine\n', 1)[1]
+        link = runtime.index('m="${f%-gnu.node}-musl.node"')
+        self.assertLess(runtime.index('COPY --from=build /usr/src/app/node_modules'), link)
+        self.assertLess(link, runtime.index('RUN node ./vcp-ci-smoke-triviumdb.cjs'))
+        self.assertIn('[ -e "$m" ] || ln -s "$(basename "$f")" "$m"', runtime)
+
     def test_repeated_patch_is_identical(self):
         once = patch.patch_dockerfile(UPSTREAM)
         self.assertEqual(patch.patch_dockerfile(once), once)
