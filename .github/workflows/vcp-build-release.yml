@@ -1478,7 +1478,7 @@ jobs:
         env:
           TAG: ${{ needs.release.outputs.tag }}
         run: |
-          $msg = "Desktop client update to $env:TAG failed on $env:RUNNER_NAME. The build and the release are not affected. Retry by re-running this job or by running the deploy-sync workflow manually."
+          $msg = "Desktop client update to $env:TAG failed on $env:RUNNER_NAME. The build and the release are not affected. Retry by re-running this job, or run the deploy-sync workflow manually with target=chat (does not touch the server)."
           Write-Host "::warning title=Desktop client not updated::$msg"
           $utf8 = New-Object System.Text.UTF8Encoding($false)
           [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, "### Desktop client not updated`n`n$msg`n", $utf8)

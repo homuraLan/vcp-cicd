@@ -302,6 +302,8 @@ if (Test-Path $InstallDir) {
     if ($existing) {
         New-Item -ItemType Directory -Force -Path $backup | Out-Null
         foreach ($item in $existing) {
+            # 用户数据不进备份：第 5 步会把它整体挪走再挪回，复制一份既慢，回滚时还会冒出两份
+            if ($item.Name -eq "AppData") { continue }
             Copy-Item $item.FullName -Destination $backup -Recurse -Force -ErrorAction SilentlyContinue
         }
         Log "已备份旧版本"
@@ -309,7 +311,48 @@ if (Test-Path $InstallDir) {
 }
 
 # ---- 5. 安装 ----
+# 打包时把数据目录改成了「程序目录\AppData」（见 vcp-build-release.yml 的桌面端打包步骤），
+# 聊天记录和设置都在里面。下面的卸载器和整目录删除会把它一起清掉。
+# 所以装之前先把它挪到部署目录下暂存：同一个盘上 Directory.Move 就是一次改名，要么整体成功、要么原样不动；
+# 客户端正开着、文件被占用时挪不动，更新就此失败，旧版本和数据都原样保留。
+# 装完挪回；安装失败回滚时同样挪回。任何时候都不覆盖、不删除数据。
+# 注意不能用 Move-Item：改名失败时它会先建好目标目录再逐个搬文件，实测会留下半截暂存目录。
+$dataDir = Join-Path $InstallDir "AppData"
+$dataKeep = Join-Path $DeployDir ".appdata-keep"
+function Test-EmptyDir($path) {
+    return (Test-Path -LiteralPath $path) -and -not (Get-ChildItem -LiteralPath $path -Force | Select-Object -First 1)
+}
+function Restore-UserData {
+    if (-not (Test-Path -LiteralPath $dataKeep)) { return }
+    if (Test-EmptyDir $dataKeep) {
+        # 空的暂存目录里没有数据，清掉即可
+        Remove-Item -LiteralPath $dataKeep -Force
+        return
+    }
+    if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null }
+    if (Test-Path -LiteralPath $dataDir) {
+        # 新包或回滚带出来的 AppData 不覆盖也不删，改名留给人工确认
+        $aside = "AppData.replaced-" + (Get-Date -Format "yyyyMMddHHmmss")
+        [System.IO.Directory]::Move($dataDir, (Join-Path $InstallDir $aside))
+        Log "程序目录里已有 AppData，改名为 $aside"
+    }
+    [System.IO.Directory]::Move($dataKeep, $dataDir)
+    Log "已恢复用户数据"
+}
+
 try {
+    if (Test-Path -LiteralPath $dataKeep) {
+        # 上次更新没来得及挪回：先挪回，再按正常流程走
+        if ((Test-Path -LiteralPath $dataDir) -and -not (Test-EmptyDir $dataKeep)) {
+            throw "数据暂存目录和程序目录里的 AppData 同时存在，请先人工确认: $dataKeep"
+        }
+        Restore-UserData
+    }
+    if (Test-Path -LiteralPath $dataDir) {
+        [System.IO.Directory]::Move($dataDir, $dataKeep)
+        Log "已暂存用户数据"
+    }
+
     if ($setup) {
         # 装之前先把旧版本清干净。
         #
@@ -346,6 +389,7 @@ try {
         Expand-Archive -Path $file -DestinationPath $InstallDir -Force
         Log "解压完成"
     }
+    Restore-UserData
 
     # ---- 5.5. 建快捷方式 ----
     #
@@ -393,6 +437,8 @@ catch {
             Copy-Item $_.FullName -Destination $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    try { Restore-UserData }
+    catch { Log "用户数据没能挪回，仍在 $dataKeep，请人工挪回: $($_.Exception.Message)" }
     exit 1
 }
 finally {
