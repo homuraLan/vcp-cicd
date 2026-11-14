@@ -24,6 +24,13 @@ SMOKE_NAME = "vcp-ci-smoke-triviumdb.cjs"
 
 SMOKE_BLOCK = f"""# >>> triviumdb-runtime-smoke
 # TriviumDB ships a GNU/glibc addon. Alpine's gcompat supplies its runtime ABI.
+# triviumdb >= 0.9 detects musl and only looks for *-musl.node, which is not
+# published; alias that name to the shipped GNU addon (kept if a real one appears).
+RUN for f in node_modules/triviumdb/triviumdb.linux-*-gnu.node; do \\
+      [ -e "$f" ] || continue; \\
+      m="${{f%-gnu.node}}-musl.node"; \\
+      [ -e "$m" ] || ln -s "$(basename "$f")" "$m"; \\
+    done
 # Exercise the final runtime image: loading alone does not prove persisted search works.
 COPY --from=build /usr/src/app/{SMOKE_NAME} ./{SMOKE_NAME}
 RUN node ./{SMOKE_NAME}
