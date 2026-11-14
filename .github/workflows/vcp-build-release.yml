@@ -1406,6 +1406,10 @@ jobs:
       && needs.release.outputs.desktop_changed == 'true'
     runs-on: [self-hosted, windows, local]
     timeout-minutes: 20
+    # 客户端更新失败（本机网络、DNS、安装器等）不算构建失败：
+    # 构建产物和 Release 在此之前已经发布，本 job 失败只标记警告，整次运行仍为成功。
+    # 重试方法：重跑本 job，或手动运行「VCP 部署对齐」。
+    continue-on-error: true
 
     steps:
       - name: 检出部署脚本
@@ -1464,6 +1468,20 @@ jobs:
             Write-Host "ERR: $_"
             exit 1
           }
+
+      - name: 更新失败提示
+        # The job has continue-on-error, so a failure no longer fails the run;
+        # leave a visible warning instead. English only: PowerShell 5.1 reads this
+        # block in the system code page (GBK), which garbles Chinese text.
+        if: failure()
+        shell: powershell
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          $msg = "Desktop client update to $env:TAG failed on $env:RUNNER_NAME. The build and the release are not affected. Retry by re-running this job or by running the deploy-sync workflow manually."
+          Write-Host "::warning title=Desktop client not updated::$msg"
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, "### Desktop client not updated`n`n$msg`n", $utf8)
 
   summary:
     name: 构建摘要

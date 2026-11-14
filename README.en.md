@@ -129,6 +129,8 @@ The build pipeline publishes new versions; deployed machines pull them on a sche
 
 Interval is configurable per component (see FAQ).
 
+A failed desktop update never fails the build: the job is marked with a warning; re-run it, or run the deploy-sync workflow manually, to retry.
+
 ## Build rules
 
 **A component is only rebuilt when its upstream actually changed.** The three
