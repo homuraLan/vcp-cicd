@@ -23,6 +23,15 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(len(notices), 1, "a failed client update must leave a visible warning")
         self.assertIn("::warning", notices[0]["run"])
 
+    def test_manual_chat_sync_does_not_touch_the_server(self):
+        flow = load("vcp-deploy-sync.yml")
+        triggers = flow.get("on", flow.get(True))  # PyYAML reads the bare key `on` as True
+        target = triggers["workflow_dispatch"]["inputs"]["target"]
+        self.assertEqual(target["default"], "all")
+        self.assertEqual(set(target["options"]), {"all", "server", "chat"})
+        self.assertIn("inputs.target != 'chat'", flow["jobs"]["sync-server"]["if"])
+        self.assertIn("inputs.target != 'server'", flow["jobs"]["sync-chat"]["if"])
+
     def test_windows_powershell_blocks_are_ascii(self):
         # PowerShell 5.1 on the self-hosted runner reads run blocks in the system
         # code page (GBK); non-ASCII text there breaks quoting at run time.

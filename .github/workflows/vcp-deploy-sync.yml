@@ -24,6 +24,17 @@ on:
     # 所以这里越密集只是判定越准，不会因此拉得更勤。
     - cron: '*/30 * * * *'
   workflow_dispatch:
+    inputs:
+      target:
+        # 手动触发会无视拉取间隔、强制对齐：选 chat 只更新桌面端，不会顺带重启服务端
+        description: '对齐哪一端'
+        required: false
+        type: choice
+        default: all
+        options:
+          - all
+          - server
+          - chat
 
 permissions:
   contents: read
@@ -114,7 +125,7 @@ jobs:
   sync-server:
     name: 对齐服务端
     needs: check
-    if: needs.check.outputs.has_backend == 'true'
+    if: needs.check.outputs.has_backend == 'true' && (github.event_name != 'workflow_dispatch' || inputs.target != 'chat')
     runs-on: [self-hosted, linux]
     timeout-minutes: 15
 
@@ -152,7 +163,7 @@ jobs:
   sync-chat:
     name: 对齐桌面端
     needs: check
-    if: needs.check.outputs.has_desktop == 'true'
+    if: needs.check.outputs.has_desktop == 'true' && (github.event_name != 'workflow_dispatch' || inputs.target != 'server')
     runs-on: [self-hosted, windows, local]
     timeout-minutes: 20
 
